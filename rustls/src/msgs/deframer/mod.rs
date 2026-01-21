@@ -3,7 +3,8 @@ use core::mem;
 use crate::error::{Error, InvalidMessage};
 use crate::msgs::codec::Reader;
 use crate::msgs::message::{
-    HEADER_SIZE, InboundOpaqueMessage, MessageError, read_opaque_message_header,
+    HEADER_SIZE, InboundOpaqueMessage, InboundOpaqueMessageImmut, MessageError,
+    read_opaque_message_header,
 };
 
 pub(crate) mod buffers;
@@ -78,6 +79,61 @@ impl<'a> Iterator for DeframerIter<'a> {
             typ,
             version,
             &mut consumed[HEADER_SIZE..],
+        )))
+    }
+}
+
+pub(crate) struct DeframerIterImmut<'a> {
+    buf: &'a [u8],
+    consumed: usize,
+}
+
+impl<'a> DeframerIterImmut<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        Self { buf, consumed: 0 }
+    }
+
+    pub(crate) fn bytes_consumed(&self) -> usize {
+        self.consumed
+    }
+}
+
+impl<'a> Iterator for DeframerIterImmut<'a> {
+    type Item = Result<InboundOpaqueMessageImmut<'a>, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut reader = Reader::init(self.buf);
+
+        let (typ, version, len) = match read_opaque_message_header(&mut reader) {
+            Ok(header) => header,
+            Err(err) => {
+                let err = match err {
+                    MessageError::TooShortForHeader | MessageError::TooShortForLength => {
+                        return None;
+                    }
+                    MessageError::InvalidEmptyPayload => InvalidMessage::InvalidEmptyPayload,
+                    MessageError::MessageTooLarge => InvalidMessage::MessageTooLarge,
+                    MessageError::InvalidContentType => InvalidMessage::InvalidContentType,
+                    MessageError::UnknownProtocolVersion => InvalidMessage::UnknownProtocolVersion,
+                };
+                return Some(Err(err.into()));
+            }
+        };
+
+        let end = HEADER_SIZE + len as usize;
+
+        self.buf.get(HEADER_SIZE..end)?;
+
+        // we now have a TLS header and body on the front of `self.buf`.  remove
+        // it from the front.
+        let (consumed, remainder) = self.buf.split_at(end);
+        self.buf = remainder;
+        self.consumed += end;
+
+        Some(Ok(InboundOpaqueMessageImmut::new(
+            typ,
+            version,
+            &consumed[HEADER_SIZE..],
         )))
     }
 }

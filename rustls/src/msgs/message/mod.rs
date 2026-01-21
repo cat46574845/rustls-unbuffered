@@ -8,7 +8,9 @@ use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::handshake::{HandshakeMessagePayload, HandshakePayload};
 
 mod inbound;
-pub use inbound::{BorrowedPayload, InboundOpaqueMessage, InboundPlainMessage};
+pub use inbound::{
+    BorrowedPayload, InboundOpaqueMessage, InboundOpaqueMessageImmut, InboundPlainMessage,
+};
 
 mod outbound;
 use alloc::vec::Vec;

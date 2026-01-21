@@ -4,7 +4,9 @@ use core::cmp::min;
 use crate::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter, MessageEncrypter};
 use crate::error::Error;
 use crate::log::trace;
-use crate::msgs::message::{InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage};
+use crate::msgs::message::{
+    InboundOpaqueMessageImmut, InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage,
+};
 
 #[derive(PartialEq)]
 enum DirectionState {
@@ -81,6 +83,51 @@ impl RecordLayer {
         match self
             .message_decrypter
             .decrypt(encr, self.read_seq)
+        {
+            Ok(plaintext) => {
+                self.read_seq += 1;
+                if !self.has_decrypted {
+                    self.has_decrypted = true;
+                }
+                Ok(Some(Decrypted {
+                    want_close_before_decrypt,
+                    plaintext,
+                }))
+            }
+            Err(Error::DecryptError) if self.doing_trial_decryption(encrypted_len) => {
+                trace!("Dropping undecryptable message after aborted early_data");
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) fn decrypt_incoming_to<'a>(
+        &mut self,
+        encr: InboundOpaqueMessageImmut<'_>,
+        out: &'a mut [u8],
+    ) -> Result<Option<Decrypted<'a>>, Error> {
+        if self.decrypt_state != DirectionState::Active {
+            return Ok(Some(Decrypted {
+                want_close_before_decrypt: false,
+                plaintext: encr.copy_to_plain_message(out)?,
+            }));
+        }
+
+        // Set to `true` if the peer appears to getting close to encrypting
+        // too many messages with this key.
+        //
+        // Perhaps if we send an alert well before their counter wraps, a
+        // buggy peer won't make a terrible mistake here?
+        //
+        // Note that there's no reason to refuse to decrypt: the security
+        // failure has already happened.
+        let want_close_before_decrypt = self.read_seq == SEQ_SOFT_LIMIT;
+
+        let encrypted_len = encr.payload.len();
+        match self
+            .message_decrypter
+            .decrypt_to(&encr, self.read_seq, out)
         {
             Ok(plaintext) => {
                 self.read_seq += 1;

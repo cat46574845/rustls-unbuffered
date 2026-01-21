@@ -8,8 +8,8 @@ use crate::enums::{ContentType, ProtocolVersion};
 use crate::error::Error;
 use crate::msgs::codec;
 pub use crate::msgs::message::{
-    BorrowedPayload, InboundOpaqueMessage, InboundPlainMessage, OutboundChunks,
-    OutboundOpaqueMessage, OutboundPlainMessage, PlainMessage, PrefixedPayload,
+    BorrowedPayload, InboundOpaqueMessage, InboundOpaqueMessageImmut, InboundPlainMessage,
+    OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, PlainMessage, PrefixedPayload,
 };
 use crate::suites::ConnectionTrafficSecrets;
 
@@ -142,6 +142,23 @@ pub trait MessageDecrypter: Send + Sync {
         msg: InboundOpaqueMessage<'a>,
         seq: u64,
     ) -> Result<InboundPlainMessage<'a>, Error>;
+
+    /// Decrypt the given TLS message `msg` into an external buffer `out`.
+    ///
+    /// Returns `(plaintext_len, content_type)` on success.
+    /// The plaintext is written to `out[..plaintext_len]`.
+    ///
+    /// Default implementation returns an error; providers that support
+    /// zero-copy decryption should override this.
+    fn decrypt_to<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        let _ = (msg, seq, out);
+        Err(Error::General("decrypt_to not implemented".into()))
+    }
 }
 
 /// Objects with this trait can encrypt TLS messages.

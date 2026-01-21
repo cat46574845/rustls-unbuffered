@@ -14,6 +14,12 @@ pub struct InboundOpaqueMessage<'a> {
     pub payload: BorrowedPayload<'a>,
 }
 
+pub struct InboundOpaqueMessageImmut<'a> {
+    pub typ: ContentType,
+    pub version: ProtocolVersion,
+    pub payload: BorrowedPayloadImmut<'a>,
+}
+
 impl<'a> InboundOpaqueMessage<'a> {
     /// Construct a new `InboundOpaqueMessage` from constituent fields.
     ///
@@ -77,10 +83,104 @@ impl<'a> InboundOpaqueMessage<'a> {
         Ok(self.into_plain_message())
     }
 }
+impl<'a> InboundOpaqueMessageImmut<'a> {
+    /// Construct a new `InboundOpaqueMessage` from constituent fields.
+    ///
+    /// `payload` is borrowed.
+    pub fn new(typ: ContentType, version: ProtocolVersion, payload: &'a [u8]) -> Self {
+        Self {
+            typ,
+            version,
+            payload: BorrowedPayloadImmut(payload),
+        }
+    }
+
+    /// Force conversion into a plaintext message.
+    ///
+    /// This should only be used for messages that are known to be in plaintext. Otherwise, the
+    /// `InboundOpaqueMessage` should be decrypted into a `PlainMessage` using a `MessageDecrypter`.
+    pub fn into_plain_message(self) -> InboundPlainMessage<'a> {
+        InboundPlainMessage {
+            typ: self.typ,
+            version: self.version,
+            payload: self.payload.into_inner(),
+        }
+    }
+
+    /// Force conversion into a plaintext message.
+    ///
+    /// `range` restricts the resulting message: this function panics if it is out of range for
+    /// the underlying message payload.
+    ///
+    /// This should only be used for messages that are known to be in plaintext. Otherwise, the
+    /// `InboundOpaqueMessage` should be decrypted into a `PlainMessage` using a `MessageDecrypter`.
+    pub fn into_plain_message_range(self, range: Range<usize>) -> InboundPlainMessage<'a> {
+        InboundPlainMessage {
+            typ: self.typ,
+            version: self.version,
+            payload: &self.payload.into_inner()[range],
+        }
+    }
+
+    /// For TLS1.3 (only), checks the length msg.payload is valid and removes the padding.
+    ///
+    /// Returns an error if the message (pre-unpadding) is too long, or the padding is invalid,
+    /// or the message (post-unpadding) is too long.
+    pub fn into_tls13_unpadded_message(mut self) -> Result<InboundPlainMessage<'a>, Error> {
+        let payload = &mut self.payload;
+
+        if payload.len() > MAX_FRAGMENT_LEN + 1 {
+            return Err(Error::PeerSentOversizedRecord);
+        }
+
+        self.typ = unpad_tls13_payload_immut(payload);
+        if self.typ == ContentType::Unknown(0) {
+            return Err(PeerMisbehaved::IllegalTlsInnerPlaintext.into());
+        }
+
+        if payload.len() > MAX_FRAGMENT_LEN {
+            return Err(Error::PeerSentOversizedRecord);
+        }
+
+        self.version = ProtocolVersion::TLSv1_3;
+        Ok(self.into_plain_message())
+    }
+
+    /// Copy payload to output buffer and return InboundPlainMessage borrowing that buffer.
+    ///
+    /// This is used when encryption is not active (during handshake) and we need
+    /// to return a message that borrows the output buffer instead of the input buffer.
+    ///
+    /// Returns an error if the output buffer is too small.
+    pub fn copy_to_plain_message<'b>(
+        self,
+        out: &'b mut [u8],
+    ) -> Result<InboundPlainMessage<'b>, Error> {
+        let len = self.payload.len();
+        if out.len() < len {
+            return Err(Error::General("output buffer too small".into()));
+        }
+        out[..len].copy_from_slice(&self.payload);
+        Ok(InboundPlainMessage {
+            typ: self.typ,
+            version: self.version,
+            payload: &out[..len],
+        })
+    }
+}
 
 pub struct BorrowedPayload<'a>(&'a mut [u8]);
+pub struct BorrowedPayloadImmut<'a>(&'a [u8]);
 
 impl Deref for BorrowedPayload<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl Deref for BorrowedPayloadImmut<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -121,12 +221,43 @@ impl<'a> BorrowedPayload<'a> {
     }
 }
 
+impl<'a> BorrowedPayloadImmut<'a> {
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len() {
+            return;
+        }
+
+        self.0 = &self.0[..len];
+    }
+
+    pub(crate) fn into_inner(self) -> &'a [u8] {
+        self.0
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<u8> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let len = self.len();
+        let last = self[len - 1];
+        self.truncate(len - 1);
+        Some(last)
+    }
+}
 /// A TLS frame, named `TLSPlaintext` in the standard.
 ///
 /// This inbound type borrows its decrypted payload from the original buffer.
 /// It results from decryption.
 #[derive(Debug)]
 pub struct InboundPlainMessage<'a> {
+    pub typ: ContentType,
+    pub version: ProtocolVersion,
+    pub payload: &'a [u8],
+}
+
+#[derive(Debug)]
+pub struct InboundPlainMessageL<'a> {
     pub typ: ContentType,
     pub version: ProtocolVersion,
     pub payload: &'a [u8],
@@ -151,6 +282,16 @@ impl InboundPlainMessage<'_> {
 ///
 /// ContentType(0) is returned if the message payload is empty or all zeroes.
 fn unpad_tls13_payload(p: &mut BorrowedPayload<'_>) -> ContentType {
+    loop {
+        match p.pop() {
+            Some(0) => {}
+            Some(content_type) => return ContentType::from(content_type),
+            None => return ContentType::Unknown(0),
+        }
+    }
+}
+
+fn unpad_tls13_payload_immut(p: &mut BorrowedPayloadImmut<'_>) -> ContentType {
     loop {
         match p.pop() {
             Some(0) => {}

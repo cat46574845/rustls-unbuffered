@@ -21,6 +21,20 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
     ) -> UnbufferedStatus<'c, 'i, ClientConnectionData> {
         self.process_tls_records_common(incoming_tls, |_| false, |_, _| unreachable!())
     }
+
+    /// Decrypts TLS records from `src` into `dst` at the specified offset.
+    ///
+    /// This API allows decrypting from one buffer to another ("read A, write B"),
+    /// enabling zero-copy patterns where multiple TLS records can be decrypted
+    /// sequentially into the same destination buffer.
+    pub fn decrypt_to(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        dst_offset: usize,
+    ) -> Result<DecryptResult, Error> {
+        todo!()
+    }
 }
 
 impl UnbufferedConnectionCommon<ServerConnectionData> {
@@ -56,6 +70,134 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 );
             }
 
+            if !self
+                .core
+                .common_state
+                .received_plaintext
+                .is_empty()
+            {
+                break (
+                    buffer.pending_discard(),
+                    ReadTraffic::new(self, incoming_tls).into(),
+                );
+            }
+
+            if let Some(chunk) = self
+                .core
+                .common_state
+                .sendable_tls
+                .pop()
+            {
+                break (
+                    buffer.pending_discard(),
+                    EncodeTlsData::new(self, chunk).into(),
+                );
+            }
+
+            let deframer_output = if self
+                .core
+                .common_state
+                .has_received_close_notify
+            {
+                None
+            } else {
+                match self
+                    .core
+                    .deframe(None, buffer.filled_mut(), &mut buffer_progress)
+                {
+                    Err(err) => {
+                        buffer.queue_discard(buffer_progress.take_discard());
+                        return UnbufferedStatus {
+                            discard: buffer.pending_discard(),
+                            state: Err(err),
+                        };
+                    }
+                    Ok(r) => r,
+                }
+            };
+
+            if let Some(msg) = deframer_output {
+                let mut state =
+                    match mem::replace(&mut self.core.state, Err(Error::HandshakeNotComplete)) {
+                        Ok(state) => state,
+                        Err(e) => {
+                            buffer.queue_discard(buffer_progress.take_discard());
+                            self.core.state = Err(e.clone());
+                            return UnbufferedStatus {
+                                discard: buffer.pending_discard(),
+                                state: Err(e),
+                            };
+                        }
+                    };
+
+                match self.core.process_msg(msg, state, None) {
+                    Ok(new) => state = new,
+
+                    Err(e) => {
+                        buffer.queue_discard(buffer_progress.take_discard());
+                        self.core.state = Err(e.clone());
+                        return UnbufferedStatus {
+                            discard: buffer.pending_discard(),
+                            state: Err(e),
+                        };
+                    }
+                }
+
+                buffer.queue_discard(buffer_progress.take_discard());
+
+                self.core.state = Ok(state);
+            } else if self.wants_write {
+                break (
+                    buffer.pending_discard(),
+                    TransmitTlsData { conn: self }.into(),
+                );
+            } else if self
+                .core
+                .common_state
+                .has_received_close_notify
+                && !self.emitted_peer_closed_state
+            {
+                self.emitted_peer_closed_state = true;
+                break (buffer.pending_discard(), ConnectionState::PeerClosed);
+            } else if self
+                .core
+                .common_state
+                .has_received_close_notify
+                && self
+                    .core
+                    .common_state
+                    .has_sent_close_notify
+            {
+                break (buffer.pending_discard(), ConnectionState::Closed);
+            } else if self
+                .core
+                .common_state
+                .may_send_application_data
+            {
+                break (
+                    buffer.pending_discard(),
+                    ConnectionState::WriteTraffic(WriteTraffic { conn: self }),
+                );
+            } else {
+                break (buffer.pending_discard(), ConnectionState::BlockedHandshake);
+            }
+        };
+
+        UnbufferedStatus {
+            discard,
+            state: Ok(state),
+        }
+    }
+
+    fn process_tls_records_fast<'c, 'i>(
+        &'c mut self,
+        incoming_tls: &[u8],
+        outcoming_tls: &mut [u8],
+    ) -> UnbufferedStatus<'c, 'i, Data> {
+        let mut buffer = DeframerSliceBuffer::new(incoming_tls);
+        let mut buffer_progress = self.core.hs_deframer.progress();
+
+        let (discard, state) = loop {
             if !self
                 .core
                 .common_state
@@ -617,4 +759,13 @@ impl StdError for EncryptError {}
 pub struct InsufficientSizeError {
     /// buffer must be at least this size
     pub required_size: usize,
+}
+
+/// Result of a decrypt_to operation.
+#[derive(Debug, Clone, Copy)]
+pub struct DecryptResult {
+    /// Number of bytes consumed from the source buffer.
+    pub consumed: usize,
+    /// Number of bytes written to the destination buffer.
+    pub written: usize,
 }
