@@ -256,13 +256,6 @@ pub struct InboundPlainMessage<'a> {
     pub payload: &'a [u8],
 }
 
-#[derive(Debug)]
-pub struct InboundPlainMessageL<'a> {
-    pub typ: ContentType,
-    pub version: ProtocolVersion,
-    pub payload: &'a [u8],
-}
-
 impl InboundPlainMessage<'_> {
     /// Returns true if the payload is a CCS message.
     ///

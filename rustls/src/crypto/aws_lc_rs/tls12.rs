@@ -3,8 +3,9 @@ use alloc::boxed::Box;
 use aws_lc_rs::{aead, tls_prf};
 
 use crate::crypto::cipher::{
-    AeadKey, InboundOpaqueMessage, Iv, KeyBlockShape, MessageDecrypter, MessageEncrypter,
-    NONCE_LEN, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError, make_tls12_aad,
+    AeadKey, InboundOpaqueMessage, InboundOpaqueMessageImmut, Iv, KeyBlockShape, MessageDecrypter,
+    MessageEncrypter, NONCE_LEN, Nonce, Tls12AeadAlgorithm, UnsupportedOperationError,
+    make_tls12_aad,
 };
 use crate::crypto::tls12::Prf;
 use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
@@ -299,6 +300,54 @@ impl MessageDecrypter for GcmMessageDecrypter {
             ),
         )
     }
+
+    fn decrypt_to<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        if msg.payload.len() < GCM_OVERHEAD {
+            return Err(Error::DecryptError);
+        }
+
+        // TLS 1.2 GCM: first 8 bytes are explicit nonce, then ciphertext+tag
+        let explicit_nonce = &msg.payload[..GCM_EXPLICIT_NONCE_LEN];
+        let ciphertext_with_tag = &msg.payload[GCM_EXPLICIT_NONCE_LEN..];
+
+        let nonce = {
+            let mut nonce = [0u8; 12];
+            nonce[..4].copy_from_slice(&self.dec_salt);
+            nonce[4..].copy_from_slice(explicit_nonce);
+            aead::Nonce::assume_unique_for_key(nonce)
+        };
+
+        let plaintext_len = msg.payload.len() - GCM_OVERHEAD;
+        let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, plaintext_len));
+
+        // Copy ciphertext+tag to output buffer for in-place decryption
+        let ciphertext_len = ciphertext_with_tag.len();
+        if out.len() < ciphertext_len {
+            return Err(Error::General("output buffer too small".into()));
+        }
+        out[..ciphertext_len].copy_from_slice(ciphertext_with_tag);
+
+        let plain_len = self
+            .dec_key
+            .open_in_place(nonce, aad, &mut out[..ciphertext_len])
+            .map_err(|_| Error::DecryptError)?
+            .len();
+
+        if plain_len > MAX_FRAGMENT_LEN {
+            return Err(Error::PeerSentOversizedRecord);
+        }
+
+        Ok(InboundPlainMessage {
+            typ: msg.typ,
+            version: msg.version,
+            payload: &out[..plain_len],
+        })
+    }
 }
 
 impl MessageEncrypter for GcmMessageEncrypter {
@@ -379,6 +428,44 @@ impl MessageDecrypter for ChaCha20Poly1305MessageDecrypter {
 
         payload.truncate(plain_len);
         Ok(msg.into_plain_message())
+    }
+
+    fn decrypt_to<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        if msg.payload.len() < CHACHAPOLY1305_OVERHEAD {
+            return Err(Error::DecryptError);
+        }
+
+        let plaintext_len = msg.payload.len() - CHACHAPOLY1305_OVERHEAD;
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.dec_offset, seq).0);
+        let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, plaintext_len));
+
+        // Copy ciphertext to output buffer for in-place decryption
+        let ciphertext_len = msg.payload.len();
+        if out.len() < ciphertext_len {
+            return Err(Error::General("output buffer too small".into()));
+        }
+        out[..ciphertext_len].copy_from_slice(&*msg.payload);
+
+        let plain_len = self
+            .dec_key
+            .open_in_place(nonce, aad, &mut out[..ciphertext_len])
+            .map_err(|_| Error::DecryptError)?
+            .len();
+
+        if plain_len > MAX_FRAGMENT_LEN {
+            return Err(Error::PeerSentOversizedRecord);
+        }
+
+        Ok(InboundPlainMessage {
+            typ: msg.typ,
+            version: msg.version,
+            payload: &out[..plain_len],
+        })
     }
 }
 

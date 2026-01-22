@@ -185,6 +185,15 @@ impl RecordLayer {
         self.decrypt_state = DirectionState::Prepared;
     }
 
+    /// Is decryption currently active?
+    ///
+    /// Returns true if the decrypt state is Active, meaning encrypted messages
+    /// will be decrypted. Returns false if still in handshake phase before keys
+    /// are established.
+    pub(crate) fn is_decrypt_active(&self) -> bool {
+        self.decrypt_state == DirectionState::Active
+    }
+
     /// Start using the `MessageEncrypter` previously provided to the previous
     /// call to `prepare_message_encrypter`.
     pub(crate) fn start_encrypting(&mut self) {

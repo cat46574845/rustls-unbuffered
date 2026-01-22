@@ -13,12 +13,22 @@ use crate::error::{Error, PeerMisbehaved};
 use crate::log::trace;
 use crate::msgs::deframer::buffers::{BufferProgress, DeframerVecBuffer, Delocator, Locator};
 use crate::msgs::deframer::handshake::HandshakeDeframer;
+use crate::msgs::deframer::handshake_buffer::HandshakeBuffer;
 use crate::msgs::deframer::{DeframerIter, DeframerIterImmut};
 use crate::msgs::handshake::Random;
 use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
 use crate::record_layer::Decrypted;
 use crate::suites::ExtractedSecrets;
 use crate::vecbuf::ChunkVecBuffer;
+
+/// Metadata about a deframed message for zero-copy API.
+/// The actual payload is in the output buffer provided to deframe_to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeframedMessage {
+    pub typ: ContentType,
+    pub version: ProtocolVersion,
+    pub payload_len: usize,
+}
 
 // pub so that it can be re-exported from the crate root
 pub mod kernel;
@@ -827,6 +837,9 @@ impl<Data> From<ConnectionCore<Data>> for ConnectionCommon<Data> {
 /// Interface shared by unbuffered client and server connections.
 pub struct UnbufferedConnectionCommon<Data> {
     pub(crate) core: ConnectionCore<Data>,
+    /// Handshake buffer for zero-copy API (process_tls_records_fast)
+    /// Placed here (not in ConnectionCore) to enable split borrow
+    pub(crate) hs_buffer_fast: Option<HandshakeBuffer>,
     wants_write: bool,
     emitted_peer_closed_state: bool,
 }
@@ -835,6 +848,7 @@ impl<Data> From<ConnectionCore<Data>> for UnbufferedConnectionCommon<Data> {
     fn from(core: ConnectionCore<Data>) -> Self {
         Self {
             core,
+            hs_buffer_fast: None,
             wants_write: false,
             emitted_peer_closed_state: false,
         }
@@ -862,7 +876,8 @@ pub(crate) struct ConnectionCore<Data> {
     pub(crate) data: Data,
     pub(crate) common_state: CommonState,
     pub(crate) hs_deframer: HandshakeDeframer,
-
+    pub(crate) hs_buffer: Option<Box<[u8]>>,
+    // Note: hs_buffer_fast moved to UnbufferedConnectionCommon for split borrow
     /// We limit consecutive empty fragments to avoid a route for the peer to send
     /// us significant but fruitless traffic.
     seen_consecutive_empty_fragments: u8,
@@ -875,6 +890,8 @@ impl<Data> ConnectionCore<Data> {
             data,
             common_state,
             hs_deframer: HandshakeDeframer::default(),
+            hs_buffer: None,
+
             seen_consecutive_empty_fragments: 0,
         }
     }
@@ -957,33 +974,39 @@ impl<Data> ConnectionCore<Data> {
         }
     }
 
-    fn deframe_to<'b>(
+    fn deframe_to(
         &mut self,
         state: Option<&dyn State<Data>>,
         buffer_in: &[u8],
-        buffer_out: &'b mut [u8],
+        buffer_out: &mut [u8],
         buffer_progress: &mut BufferProgress,
-    ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
-        // before processing any more of `buffer`, return any extant messages from `hs_deframer`
+        hs_buffer_fast: &mut Option<HandshakeBuffer>,
+    ) -> Result<Option<DeframedMessage>, Error> {
+        // Before processing any more input, return any extant messages from hs_deframer
         if self.hs_deframer.has_message_ready() {
-            Ok(self.take_handshake_message_immut(buffer_in, buffer_progress))
-        } else {
-            self.process_more_input(state, buffer, buffer_progress)
-        }
-    }
+            if let Some(ref hs_buffer) = self.hs_buffer {
+                if let Some((hs_msg, discard)) = self.hs_deframer.iter(hs_buffer).next() {
+                    buffer_progress.add_discard(discard);
 
-    fn take_handshake_message_immut<'b>(
-        &mut self,
-        buffer: &'b [u8],
-        buffer_progress: &mut BufferProgress,
-    ) -> Option<InboundPlainMessage<'b>> {
-        self.hs_deframer
-            .iter(buffer)
-            .next()
-            .map(|(message, discard)| {
-                buffer_progress.add_discard(discard);
-                message
-            })
+                    // Copy handshake payload to output buffer
+                    let hs_payload_len = hs_msg.payload.len();
+                    buffer_out[..hs_payload_len].copy_from_slice(hs_msg.payload);
+
+                    return Ok(Some(DeframedMessage {
+                        typ: hs_msg.typ,
+                        version: hs_msg.version,
+                        payload_len: hs_payload_len,
+                    }));
+                }
+            }
+        }
+        self.process_more_input_to(
+            state,
+            buffer_in,
+            buffer_out,
+            buffer_progress,
+            hs_buffer_fast,
+        )
     }
 
     fn take_handshake_message<'b>(
@@ -999,19 +1022,39 @@ impl<Data> ConnectionCore<Data> {
                 message
             })
     }
-    fn process_more_input_to<'b>(
+
+    fn process_more_input_to(
         &mut self,
         state: Option<&dyn State<Data>>,
         in_buffer: &[u8],
-        out_buffer: &'b mut [u8],
+        out_buffer: &mut [u8],
         buffer_progress: &mut BufferProgress,
-    ) -> Result<Option<InboundPlainMessage<'b>>, Error> {
+        hs_buffer_fast: &mut Option<HandshakeBuffer>,
+    ) -> Result<Option<DeframedMessage>, Error> {
         let version_is_tls13 = matches!(
             self.common_state.negotiated_version,
             Some(ProtocolVersion::TLSv1_3)
         );
 
-        let locator = Locator::new(in_buffer);
+        // Check if HandshakeBuffer has messages ready before processing more input
+        // Return signal only, do NOT consume - consumption happens in process_tls_records_fast
+        if let Some(ref hs_buf) = hs_buffer_fast {
+            if hs_buf.has_message_ready() {
+                // Trial decryption finishes with the first handshake message after it started.
+                self.common_state
+                    .record_layer
+                    .finish_trial_decryption();
+
+                // Signal that handshake message is ready (payload_len=0 indicates get from hs_buffer_fast)
+                return Ok(Some(DeframedMessage {
+                    typ: ContentType::Handshake,
+                    version: hs_buf
+                        .version
+                        .unwrap_or(ProtocolVersion::TLSv1_2),
+                    payload_len: 0, // Signal: consumer should call hs_buffer_fast.next_message()
+                }));
+            }
+        }
 
         loop {
             let mut iter = DeframerIterImmut::new(&in_buffer[buffer_progress.processed()..]);
@@ -1027,10 +1070,8 @@ impl<Data> ConnectionCore<Data> {
                     // CCS messages are always plaintext.
                     ContentType::ChangeCipherSpec => true,
                     // Alerts are allowed to be plaintext if-and-only-if:
-                    // * The negotiated protocol version is TLS 1.3. - In TLS 1.2 it is unambiguous when
-                    //   keying changes based on the CCS message. Only TLS 1.3 requires these heuristics.
-                    // * We have not yet decrypted any messages from the peer - if we have we don't
-                    //   expect any plaintext.
+                    // * The negotiated protocol version is TLS 1.3.
+                    // * We have not yet decrypted any messages from the peer.
                     // * The payload size is indicative of a plaintext alert message.
                     ContentType::Alert
                         if version_is_tls13
@@ -1046,51 +1087,167 @@ impl<Data> ConnectionCore<Data> {
                     _ => false,
                 };
 
-                if allowed_plaintext && !self.hs_deframer.is_active() {
+                // Plaintext path 1: CCS/Alert while no handshake data pending
+                if allowed_plaintext && !hs_buffer_fast_is_active(hs_buffer_fast) {
                     break (message.into_plain_message(), iter.bytes_consumed());
                 }
 
-                let message = match self
+                // Plaintext path 2: encryption not yet active (early handshake)
+                if !self
                     .common_state
                     .record_layer
-                    .decrypt_incoming_to(message, out_buffer)
+                    .is_decrypt_active()
                 {
-                    // failed decryption during trial decryption is not allowed to be
-                    // interleaved with partial handshake data.
-                    Ok(None) if !self.hs_deframer.is_aligned() => {
-                        return Err(
-                            PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage.into(),
+                    break (message.into_plain_message(), iter.bytes_consumed());
+                }
+
+                // Encrypted message: select decrypt target based on connection phase
+                let expecting_app_data = self
+                    .common_state
+                    .may_receive_application_data;
+
+                // Two completely separate paths to avoid borrow conflicts
+                if expecting_app_data {
+                    // === Application phase: decrypt to out_buffer ===
+                    let decrypt_result = self
+                        .common_state
+                        .record_layer
+                        .decrypt_incoming_to(message, out_buffer);
+
+                    let message = match decrypt_result {
+                        Ok(None) if !hs_buffer_fast_is_aligned(hs_buffer_fast) => {
+                            return Err(
+                                PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage
+                                    .into(),
+                            );
+                        }
+                        Ok(None) => continue,
+                        Ok(Some(message)) => message,
+                        Err(err) => return Err(self.handle_deframe_error(err, state)),
+                    };
+
+                    let Decrypted {
+                        want_close_before_decrypt,
+                        plaintext,
+                    } = message;
+
+                    if want_close_before_decrypt {
+                        self.common_state.send_close_notify();
+                    }
+
+                    // If it's Handshake (KeyUpdate), need to copy to hs_buffer
+                    if plaintext.typ == ContentType::Handshake {
+                        let payload_len = plaintext.payload.len();
+                        let version = plaintext.version;
+                        let typ = plaintext.typ;
+                        // Copy to hs_buffer (must drop plaintext first to release out_buffer)
+                        drop(plaintext);
+
+                        let hs_buf = hs_buffer_fast.get_or_insert_with(HandshakeBuffer::new);
+                        hs_buf.append(&out_buffer[..payload_len], version)?;
+
+                        // Return placeholder - actual data will come from hs_buffer
+                        break (
+                            InboundPlainMessage {
+                                typ,
+                                version,
+                                payload: &[],
+                            },
+                            iter.bytes_consumed(),
                         );
                     }
 
-                    // failed decryption during trial decryption.
-                    Ok(None) => continue,
+                    break (plaintext, iter.bytes_consumed());
+                } else {
+                    // === Handshake phase: decrypt to HandshakeBuffer ===
+                    // Extract all needed info in a block to end borrow
+                    let (typ, version, payload_len, want_close) = {
+                        let hs_buf = hs_buffer_fast.get_or_insert_with(HandshakeBuffer::new);
+                        let decrypt_target = hs_buf.get_decrypt_buffer();
 
-                    Ok(Some(message)) => message,
+                        let decrypt_result = self
+                            .common_state
+                            .record_layer
+                            .decrypt_incoming_to(message, decrypt_target);
 
-                    Err(err) => return Err(self.handle_deframe_error(err, state)),
-                };
+                        match decrypt_result {
+                            Ok(None) => {
+                                // Check alignment before continuing
+                                let _ = decrypt_target;
+                                if !hs_buffer_fast_is_aligned(hs_buffer_fast) {
+                                    return Err(
+                                        PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage
+                                            .into(),
+                                    );
+                                }
+                                continue;
+                            }
+                            Ok(Some(decrypted)) => {
+                                let Decrypted {
+                                    want_close_before_decrypt,
+                                    plaintext,
+                                } = decrypted;
+                                (
+                                    plaintext.typ,
+                                    plaintext.version,
+                                    plaintext.payload.len(),
+                                    want_close_before_decrypt,
+                                )
+                            }
+                            Err(err) => return Err(self.handle_deframe_error(err, state)),
+                        }
+                    };
+                    // Borrow of hs_buffer_fast is now released
 
-                let Decrypted {
-                    want_close_before_decrypt,
-                    plaintext,
-                } = message;
+                    if want_close {
+                        self.common_state.send_close_notify();
+                    }
 
-                if want_close_before_decrypt {
-                    self.common_state.send_close_notify();
+                    let bytes_consumed = iter.bytes_consumed();
+
+                    // If it's AppData (0-RTT) or non-Handshake (Alert/CCS), copy from hs_buffer to out_buffer
+                    // These message types need to be returned with their payload, not buffered for later
+                    if typ != ContentType::Handshake {
+                        // Get the data from hs_buffer decrypt area (it's at the write position, not committed)
+                        // The decrypted data is in hs_buf.buffer[hs_buf.write_pos..hs_buf.write_pos + payload_len]
+                        // But since confirm_decrypt wasn't called yet, we need to access it differently
+                        let hs_buf = hs_buffer_fast.as_ref().unwrap();
+                        let decrypt_buf = hs_buf.get_decrypt_area();
+                        // The data was just decrypted to the start of the decrypt area
+                        out_buffer[..payload_len].copy_from_slice(&decrypt_buf[..payload_len]);
+
+                        break (
+                            InboundPlainMessage {
+                                typ,
+                                version,
+                                payload: &out_buffer[..payload_len],
+                            },
+                            bytes_consumed,
+                        );
+                    }
+
+                    // Handshake only: confirm the decrypt to commit data to buffer
+                    let hs_buf = hs_buffer_fast.as_mut().unwrap();
+                    hs_buf.confirm_decrypt(payload_len);
+
+                    // Return placeholder - actual data will come from hs_buffer.next_message()
+                    break (
+                        InboundPlainMessage {
+                            typ,
+                            version,
+                            payload: &[],
+                        },
+                        bytes_consumed,
+                    );
                 }
-
-                break (plaintext, iter.bytes_consumed());
             };
 
-            if !self.hs_deframer.is_aligned() && message.typ != ContentType::Handshake {
-                // "Handshake messages MUST NOT be interleaved with other record
-                // types.  That is, if a handshake message is split over two or more
-                // records, there MUST NOT be any other records between them."
-                // https://www.rfc-editor.org/rfc/rfc8446#section-5.1
+            // Check interleaving rule (RFC 8446 Section 5.1)
+            if !hs_buffer_fast_is_aligned(hs_buffer_fast) && message.typ != ContentType::Handshake {
                 return Err(PeerMisbehaved::MessageInterleavedWithHandshakeMessage.into());
             }
 
+            // Check empty fragments
             match message.payload.len() {
                 0 => {
                     if self.seen_consecutive_empty_fragments
@@ -1107,39 +1264,73 @@ impl<Data> ConnectionCore<Data> {
 
             buffer_progress.add_processed(processed);
 
-            // do an end-run around the borrow checker, converting `message` (containing
-            // a borrowed slice) to an unborrowed one (containing a `Range` into the
-            // same buffer).  the reborrow happens inside the branch that returns the
-            // message.
-            //
-            // is fixed by -Zpolonius
-            // https://github.com/rust-lang/rfcs/blob/master/text/2094-nll.md#problem-case-3-conditional-control-flow-across-functions
-            let unborrowed = InboundUnborrowedMessage::unborrow(&locator, message);
-
-            if unborrowed.typ != ContentType::Handshake {
-                let message = unborrowed.reborrow(&Delocator::new(buffer));
-                buffer_progress.add_discard(processed);
-                return Ok(Some(message));
-            }
-
-            let message = unborrowed.reborrow(&Delocator::new(buffer));
-            self.hs_deframer
-                .input_message(message, &locator, buffer_progress.processed());
-            self.hs_deframer.coalesce(buffer)?;
-
-            self.common_state.aligned_handshake = self.hs_deframer.is_aligned();
-
-            if self.hs_deframer.has_message_ready() {
-                // trial decryption finishes with the first handshake message after it started.
-                self.common_state
+            // Handle message by type
+            if message.typ == ContentType::Handshake {
+                // Plaintext Handshake: append to HandshakeBuffer
+                if !self
+                    .common_state
                     .record_layer
-                    .finish_trial_decryption();
+                    .is_decrypt_active()
+                {
+                    let hs_buf = hs_buffer_fast.get_or_insert_with(HandshakeBuffer::new);
+                    hs_buf.append(message.payload, message.version)?;
+                }
 
-                return Ok(self.take_handshake_message_immut(buffer, buffer_progress));
+                // Update aligned_handshake flag
+                self.common_state.aligned_handshake = hs_buffer_fast_is_aligned(hs_buffer_fast);
+
+                // Check if complete message is ready
+                if let Some(ref hs_buf) = hs_buffer_fast {
+                    if hs_buf.has_message_ready() {
+                        // Trial decryption finishes with the first handshake message
+                        self.common_state
+                            .record_layer
+                            .finish_trial_decryption();
+
+                        buffer_progress.add_discard(processed);
+
+                        // Signal only - do NOT consume via next_message()
+                        // Consumption happens in process_tls_records_fast via take()+next_message()
+                        return Ok(Some(DeframedMessage {
+                            typ: ContentType::Handshake,
+                            version: hs_buf
+                                .version
+                                .unwrap_or(ProtocolVersion::TLSv1_2),
+                            payload_len: 0, // Signal: consumer should call hs_buffer_fast.next_message()
+                        }));
+                    }
+                }
+                // No complete message ready, continue loop for more data
+                continue;
             }
+
+            // Non-Handshake: return metadata (payload is in out_buffer)
+            buffer_progress.add_discard(processed);
+            return Ok(Some(DeframedMessage {
+                typ: message.typ,
+                version: message.version,
+                payload_len: message.payload.len(),
+            }));
         }
     }
+}
 
+/// Helper: Is HandshakeBuffer active (has any data)?
+fn hs_buffer_fast_is_active(hs_buffer_fast: &Option<HandshakeBuffer>) -> bool {
+    hs_buffer_fast
+        .as_ref()
+        .is_some_and(|b| b.is_active())
+}
+
+/// Helper: Is HandshakeBuffer aligned (no partial messages)?
+fn hs_buffer_fast_is_aligned(hs_buffer_fast: &Option<HandshakeBuffer>) -> bool {
+    hs_buffer_fast
+        .as_ref()
+        .map(|b| b.is_aligned())
+        .unwrap_or(true)
+}
+
+impl<Data> ConnectionCore<Data> {
     fn process_more_input<'b>(
         &mut self,
         state: Option<&dyn State<Data>>,

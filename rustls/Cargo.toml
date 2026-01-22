@@ -111,6 +111,10 @@ path = "tests/runners/server_cert_verifier.rs"
 name = "unbuffered"
 path = "tests/runners/unbuffered.rs"
 
+[[test]]
+name = "unbuffered_fast"
+path = "tests/runners/unbuffered_fast.rs"
+
 [package.metadata.docs.rs]
 # all non-default features except fips (cannot build on docs.rs environment)
 features = ["read_buf", "ring"]

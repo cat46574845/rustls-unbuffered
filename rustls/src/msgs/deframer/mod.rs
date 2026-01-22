@@ -9,6 +9,7 @@ use crate::msgs::message::{
 
 pub(crate) mod buffers;
 pub(crate) mod handshake;
+pub(crate) mod handshake_buffer;
 
 /// A deframer of TLS wire messages.
 ///

@@ -4,7 +4,7 @@ use super::ring_like::hkdf::KeyType;
 use super::ring_like::{aead, hkdf, hmac};
 use crate::crypto;
 use crate::crypto::cipher::{
-    AeadKey, InboundOpaqueMessage, Iv, MessageDecrypter, MessageEncrypter, Nonce,
+    AeadKey, InboundOpaqueMessage, InboundOpaqueMessageImmut, Iv, MessageDecrypter, MessageEncrypter, Nonce,
     Tls13AeadAlgorithm, UnsupportedOperationError, make_tls13_aad,
 };
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
@@ -253,6 +253,56 @@ impl MessageDecrypter for Tls13MessageDecrypter {
 
         payload.truncate(plain_len);
         msg.into_tls13_unpadded_message()
+    }
+
+    fn decrypt_to<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        let tag_len = self.dec_key.algorithm().tag_len();
+        if msg.payload.len() < tag_len {
+            return Err(Error::DecryptError);
+        }
+
+        // Copy ciphertext to output buffer for in-place decryption
+        let ciphertext_len = msg.payload.len();
+        if out.len() < ciphertext_len {
+            return Err(Error::General("output buffer too small".into()));
+        }
+        out[..ciphertext_len].copy_from_slice(&*msg.payload);
+
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let aad = aead::Aad::from(make_tls13_aad(ciphertext_len));
+        let plain_len = self
+            .dec_key
+            .open_in_place(nonce, aad, &mut out[..ciphertext_len])
+            .map_err(|_| Error::DecryptError)?
+            .len();
+
+        // TLS 1.3: remove padding and extract content type from end
+        // Find the real content type (last non-zero byte)
+        let mut content_type_byte = 0u8;
+        let mut actual_len = plain_len;
+        for i in (0..plain_len).rev() {
+            if out[i] != 0 {
+                content_type_byte = out[i];
+                actual_len = i;
+                break;
+            }
+        }
+
+        let content_type = ContentType::from(content_type_byte);
+        if content_type == ContentType::Unknown(content_type_byte) {
+            return Err(Error::DecryptError);
+        }
+
+        Ok(InboundPlainMessage {
+            typ: content_type,
+            version: ProtocolVersion::TLSv1_3,
+            payload: &out[..actual_len],
+        })
     }
 }
 

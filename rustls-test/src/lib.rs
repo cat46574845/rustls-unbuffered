@@ -1663,6 +1663,25 @@ mod plaintext {
         ) -> Result<InboundPlainMessage<'a>, Error> {
             Ok(msg.into_plain_message())
         }
+
+        fn decrypt_to<'a>(
+            &mut self,
+            msg: &rustls::crypto::cipher::InboundOpaqueMessageImmut<'_>,
+            _seq: u64,
+            out: &'a mut [u8],
+        ) -> Result<InboundPlainMessage<'a>, Error> {
+            // Copy payload to output buffer
+            let payload_len = msg.payload.len();
+            if out.len() < payload_len {
+                return Err(Error::General("output buffer too small".into()));
+            }
+            out[..payload_len].copy_from_slice(&*msg.payload);
+            Ok(InboundPlainMessage {
+                typ: msg.typ,
+                version: msg.version,
+                payload: &out[..payload_len],
+            })
+        }
     }
 }
 
