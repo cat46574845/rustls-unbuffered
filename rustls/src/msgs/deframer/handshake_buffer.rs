@@ -121,10 +121,10 @@ impl HandshakeBuffer {
     /// * `Ok(())` - Successfully appended
     /// * `Err(Error)` - Buffer overflow (exceeds max limit)
     pub(crate) fn append(&mut self, payload: &[u8], version: ProtocolVersion) -> Result<(), Error> {
-        // Record version (on first append)
-        if self.version.is_none() {
-            self.version = Some(version);
-        }
+        // Always update version to use the latest received version
+        // This is important for TLS 1.3 where early handshake messages are plaintext (TLS 1.2 record version)
+        // but encrypted handshake messages have TLSv1_3 version set by decrypt_to
+        self.version = Some(version);
 
         // Check if space is sufficient
         if self.available_space() < payload.len() {
@@ -152,42 +152,6 @@ impl HandshakeBuffer {
         self.write_pos += payload.len();
 
         Ok(())
-    }
-
-    // =========================================================================
-    // Public methods: Get decrypt target
-    // =========================================================================
-
-    /// Get writable region for decrypt_incoming_to to use
-    ///
-    /// Automatically compacts the buffer before returning to maximize available space.
-    ///
-    /// # Returns
-    /// Writable slice from write_pos to end of buffer
-    pub(crate) fn get_decrypt_buffer(&mut self) -> &mut [u8] {
-        self.compact();
-        &mut self.buffer[self.write_pos..]
-    }
-
-    /// Confirm the number of bytes written after decryption
-    ///
-    /// Call this method after decrypt_incoming_to succeeds to update write_pos.
-    ///
-    /// # Arguments
-    /// * `len` - Number of bytes written after decryption
-    pub(crate) fn confirm_decrypt(&mut self, len: usize) {
-        self.write_pos += len;
-    }
-
-    /// Get read-only access to freshly decrypted data before confirm_decrypt is called
-    ///
-    /// This is used for non-Handshake messages (Alert/CCS) that need to be copied to
-    /// out_buffer rather than kept in the handshake buffer.
-    ///
-    /// # Returns
-    /// Slice from write_pos to end of buffer (the decrypt target area)
-    pub(crate) fn get_decrypt_area(&self) -> &[u8] {
-        &self.buffer[self.write_pos..]
     }
 
     // =========================================================================
@@ -293,46 +257,6 @@ impl HandshakeBuffer {
         self.read_pos = 0;
         self.write_pos = 0;
         self.version = None;
-    }
-
-    /// Copy the next complete handshake message to an external buffer
-    ///
-    /// This method is useful when the caller needs to avoid holding a borrow
-    /// on the HandshakeBuffer while processing the message.
-    ///
-    /// # Arguments
-    /// * `out` - External buffer to copy the message to
-    ///
-    /// # Returns
-    /// * `Some((typ, version, len))` - Message metadata if copied successfully
-    /// * `None` - No complete message or buffer too small
-    pub(crate) fn copy_next_message_to(
-        &mut self,
-        out: &mut [u8],
-    ) -> Option<(ContentType, ProtocolVersion, usize)> {
-        let msg_len = self.peek_message_len()?;
-
-        if self.pending_len() < msg_len {
-            return None;
-        }
-
-        if out.len() < msg_len {
-            return None; // Output buffer too small
-        }
-
-        let start = self.read_pos;
-        let end = start + msg_len;
-        out[..msg_len].copy_from_slice(&self.buffer[start..end]);
-
-        // Consume message
-        self.read_pos = end;
-
-        Some((
-            ContentType::Handshake,
-            self.version
-                .unwrap_or(ProtocolVersion::TLSv1_2),
-            msg_len,
-        ))
     }
 }
 

@@ -922,7 +922,7 @@ struct TemperCounters {
     allowed_warning_alerts: u8,
     allowed_renegotiation_requests: u8,
     allowed_key_update_requests: u8,
-    allowed_middlebox_ccs: u8,
+    pub(super) allowed_middlebox_ccs: u8,
 }
 
 impl TemperCounters {

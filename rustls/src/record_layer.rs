@@ -185,15 +185,6 @@ impl RecordLayer {
         self.decrypt_state = DirectionState::Prepared;
     }
 
-    /// Is decryption currently active?
-    ///
-    /// Returns true if the decrypt state is Active, meaning encrypted messages
-    /// will be decrypted. Returns false if still in handshake phase before keys
-    /// are established.
-    pub(crate) fn is_decrypt_active(&self) -> bool {
-        self.decrypt_state == DirectionState::Active
-    }
-
     /// Start using the `MessageEncrypter` previously provided to the previous
     /// call to `prepare_message_encrypter`.
     pub(crate) fn start_encrypting(&mut self) {
@@ -388,5 +379,85 @@ mod tests {
         assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
         assert_eq!(record_layer.read_seq, 0);
         assert!(record_layer.has_decrypted());
+    }
+
+    /// 測試 decrypt_incoming_to（零拷貝解密）的狀態追蹤
+    ///
+    /// 驗證要點：
+    /// - decrypt_incoming_to 應該與 decrypt_incoming 一樣更新 read_seq
+    /// - decrypt_incoming_to 應該與 decrypt_incoming 一樣設置 has_decrypted
+    #[test]
+    fn test_has_decrypted_with_decrypt_to() {
+        use crate::msgs::message::InboundOpaqueMessageImmut;
+        use crate::{ContentType, ProtocolVersion};
+
+        // PassThroughDecrypter 的零拷貝版本
+        struct PassThroughDecrypterWithTo;
+        impl MessageDecrypter for PassThroughDecrypterWithTo {
+            fn decrypt<'a>(
+                &mut self,
+                m: InboundOpaqueMessage<'a>,
+                _: u64,
+            ) -> Result<InboundPlainMessage<'a>, Error> {
+                Ok(m.into_plain_message())
+            }
+
+            fn decrypt_to<'a>(
+                &mut self,
+                msg: &InboundOpaqueMessageImmut<'_>,
+                _seq: u64,
+                out: &'a mut [u8],
+            ) -> Result<InboundPlainMessage<'a>, Error> {
+                // 複製 payload 到輸出緩衝區
+                let len = msg.payload.len();
+                out[..len].copy_from_slice(&msg.payload);
+                Ok(InboundPlainMessage {
+                    typ: msg.typ,
+                    version: msg.version,
+                    payload: &out[..len],
+                })
+            }
+        }
+
+        // 創建 record layer 並準備解密
+        let mut record_layer = RecordLayer::new();
+        record_layer.prepare_message_decrypter(Box::new(PassThroughDecrypterWithTo));
+        record_layer.start_decrypting();
+        assert_eq!(record_layer.read_seq, 0);
+        assert!(!record_layer.has_decrypted());
+
+        // 使用 decrypt_incoming_to 解密消息
+        let payload = [0xC0, 0xFF, 0xEE];
+        let msg = InboundOpaqueMessageImmut::new(
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &payload,
+        );
+        let mut out_buf = [0u8; 256];
+        record_layer
+            .decrypt_incoming_to(msg, &mut out_buf)
+            .unwrap();
+
+        // 驗證 decrypt_incoming_to 更新了狀態
+        assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
+        assert_eq!(
+            record_layer.read_seq, 1,
+            "decrypt_incoming_to 應該增加 read_seq"
+        );
+        assert!(
+            record_layer.has_decrypted(),
+            "decrypt_incoming_to 應該設置 has_decrypted"
+        );
+
+        // 解密第二條消息
+        let msg2 = InboundOpaqueMessageImmut::new(
+            ContentType::ApplicationData,
+            ProtocolVersion::TLSv1_2,
+            &payload,
+        );
+        record_layer
+            .decrypt_incoming_to(msg2, &mut out_buf)
+            .unwrap();
+        assert_eq!(record_layer.read_seq, 2, "read_seq 應該繼續增加");
     }
 }

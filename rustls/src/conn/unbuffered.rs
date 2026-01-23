@@ -8,8 +8,7 @@ use std::error::Error as StdError;
 
 use super::UnbufferedConnectionCommon;
 use crate::client::ClientConnectionData;
-use crate::msgs::deframer::buffers::DeframerSliceBuffer;
-use crate::msgs::message::InboundPlainMessage;
+use crate::msgs::deframer::buffers::{BufferProgress, DeframerSliceBuffer};
 use crate::server::ServerConnectionData;
 use crate::{ContentType, Error};
 
@@ -202,29 +201,24 @@ impl<Data> UnbufferedConnectionCommon<Data> {
         incoming_tls: &[u8],
         outgoing_tls: &mut [u8],
     ) -> UnbufferedStatus<'c, 'c, Data> {
-        let mut buffer_progress = self.core.hs_deframer.progress();
-        let mut discard_total = 0usize;
+        // Use fresh BufferProgress for immutable input - starts at 0 each call
+        let mut buffer_progress = BufferProgress::new(0);
 
         let (discard, state) = loop {
-            // Note: received_plaintext should not have data in zero-copy path
-            // It's only used by the old API that copies to internal buffer
-            debug_assert!(
-                self.core
-                    .common_state
-                    .received_plaintext
-                    .is_empty(),
-                "received_plaintext should be empty in zero-copy path"
-            );
-
+            // Check for sendable TLS data
             if let Some(chunk) = self
                 .core
                 .common_state
                 .sendable_tls
                 .pop()
             {
-                break (discard_total, EncodeTlsData::new(self, chunk).into());
+                break (
+                    buffer_progress.processed(),
+                    EncodeTlsData::new(self, chunk).into(),
+                );
             }
 
+            // Get next message
             let deframer_output = if self
                 .core
                 .common_state
@@ -232,14 +226,16 @@ impl<Data> UnbufferedConnectionCommon<Data> {
             {
                 None
             } else {
-                match self
-                    .core
-                    .deframe_to(None, incoming_tls, outgoing_tls, &mut buffer_progress, &mut self.hs_buffer_fast)
-                {
+                match self.core.deframe_to(
+                    None,
+                    incoming_tls,
+                    outgoing_tls,
+                    &mut buffer_progress,
+                    &mut self.hs_buffer_fast,
+                ) {
                     Err(err) => {
-                        discard_total += buffer_progress.take_discard();
                         return UnbufferedStatus {
-                            discard: discard_total,
+                            discard: buffer_progress.processed(),
                             state: Err(err),
                         };
                     }
@@ -255,140 +251,45 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                         .common_state
                         .may_receive_application_data
                 {
-                    discard_total += buffer_progress.take_discard();
                     break (
-                        discard_total,
-                        ConnectionState::FastReadLen(FastReadLen(msg.payload_len)),
+                        buffer_progress.processed(),
+                        ConnectionState::FastReadLen(FastReadLen(msg.payload.len())),
                     );
                 }
 
-                // Handshake and other messages: go through state machine
-                // Handle Handshake and non-Handshake messages separately to avoid borrow conflicts
-                if msg.typ == ContentType::Handshake {
-                    // Handshake path: get message from hs_buffer_fast
-                    // Extract state first
-                    let mut state = match mem::replace(
-                        &mut self.core.state,
-                        Err(Error::HandshakeNotComplete),
-                    ) {
+                // All other messages: go through state machine
+                let mut state =
+                    match mem::replace(&mut self.core.state, Err(Error::HandshakeNotComplete)) {
                         Ok(state) => state,
                         Err(e) => {
-                            discard_total += buffer_progress.take_discard();
                             self.core.state = Err(e.clone());
                             return UnbufferedStatus {
-                                discard: discard_total,
+                                discard: buffer_progress.processed(),
                                 state: Err(e),
                             };
                         }
                     };
 
-                    // Process all ready handshake messages
-                    loop {
-                        // Take hs_buffer_fast out temporarily to avoid borrow conflict
-                        let mut hs_buf = match self.hs_buffer_fast.take() {
-                            Some(buf) => buf,
-                            None => break,
+                match self.core.process_msg(msg, state, None) {
+                    Ok(new) => state = new,
+                    Err(e) => {
+                        self.core.state = Err(e.clone());
+                        return UnbufferedStatus {
+                            discard: buffer_progress.processed(),
+                            state: Err(e),
                         };
-
-                        let plain_msg = match hs_buf.next_message() {
-                            Some(msg) => msg,
-                            None => {
-                                // No more messages, put buffer back
-                                self.hs_buffer_fast = Some(hs_buf);
-                                break;
-                            }
-                        };
-
-                        // Process the message while hs_buf is still borrowed by plain_msg
-                        let result = self
-                            .core
-                            .process_msg(plain_msg, state, None);
-
-                        // Put buffer back after message borrow ends
-                        self.hs_buffer_fast = Some(hs_buf);
-
-                        match result {
-                            Ok(new) => state = new,
-                            Err(e) => {
-                                discard_total += buffer_progress.take_discard();
-                                self.core.state = Err(e.clone());
-                                return UnbufferedStatus {
-                                    discard: discard_total,
-                                    state: Err(e),
-                                };
-                            }
-                        }
-                    }
-
-                    discard_total += buffer_progress.take_discard();
-                    self.core.state = Ok(state);
-                    
-                    // Check if we need to break after processing handshake
-                    if self.wants_write {
-                        break (discard_total, TransmitTlsData { conn: self }.into());
-                    }
-                } else {
-                    // Non-Handshake path: decide payload source based on buffer sizes
-                    // If outgoing_tls is too small (e.g., empty), payload is in hs_buffer_fast
-                    let plain_msg = if outgoing_tls.len() >= msg.payload_len {
-                        // Normal case: payload is in outgoing_tls
-                        InboundPlainMessage {
-                            typ: msg.typ,
-                            version: msg.version,
-                            payload: &outgoing_tls[..msg.payload_len],
-                        }
-                    } else {
-                        // Handshake phase with empty out_buffer: payload in hs_buffer_fast decrypt area
-                        let hs_buf = self.hs_buffer_fast.as_ref()
-                            .expect("hs_buffer_fast should exist for non-Handshake message in handshake phase");
-                        let decrypt_area = hs_buf.get_decrypt_area();
-                        InboundPlainMessage {
-                            typ: msg.typ,
-                            version: msg.version,
-                            payload: &decrypt_area[..msg.payload_len],
-                        }
-                    };
-
-                    let mut state = match mem::replace(
-                        &mut self.core.state,
-                        Err(Error::HandshakeNotComplete),
-                    ) {
-                        Ok(state) => state,
-                        Err(e) => {
-                            discard_total += buffer_progress.take_discard();
-                            self.core.state = Err(e.clone());
-                            return UnbufferedStatus {
-                                discard: discard_total,
-                                state: Err(e),
-                            };
-                        }
-                    };
-
-                    match self
-                        .core
-                        .process_msg(plain_msg, state, None)
-                    {
-                        Ok(new) => state = new,
-                        Err(e) => {
-                            discard_total += buffer_progress.take_discard();
-                            self.core.state = Err(e.clone());
-                            return UnbufferedStatus {
-                                discard: discard_total,
-                                state: Err(e),
-                            };
-                        }
-                    }
-
-                    discard_total += buffer_progress.take_discard();
-                    self.core.state = Ok(state);
-                    
-                    // Check if we need to break after processing message
-                    if self.wants_write {
-                        break (discard_total, TransmitTlsData { conn: self }.into());
                     }
                 }
+
+                // For immutable input, discard equals processed after message handling
+                // Don't call take_discard as it modifies processed offset
+                self.core.state = Ok(state);
             } else if self.wants_write {
-                break (discard_total, TransmitTlsData { conn: self }.into());
+                // Return processed as discard - indicates how many bytes were consumed
+                break (
+                    buffer_progress.processed(),
+                    TransmitTlsData { conn: self }.into(),
+                );
             } else if self
                 .core
                 .common_state
@@ -396,7 +297,7 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                 && !self.emitted_peer_closed_state
             {
                 self.emitted_peer_closed_state = true;
-                break (discard_total, ConnectionState::PeerClosed);
+                break (buffer_progress.processed(), ConnectionState::PeerClosed);
             } else if self
                 .core
                 .common_state
@@ -406,18 +307,21 @@ impl<Data> UnbufferedConnectionCommon<Data> {
                     .common_state
                     .has_sent_close_notify
             {
-                break (discard_total, ConnectionState::Closed);
+                break (buffer_progress.processed(), ConnectionState::Closed);
             } else if self
                 .core
                 .common_state
                 .may_send_application_data
             {
                 break (
-                    discard_total,
+                    buffer_progress.processed(),
                     ConnectionState::WriteTraffic(WriteTraffic { conn: self }),
                 );
             } else {
-                break (discard_total, ConnectionState::BlockedHandshake);
+                break (
+                    buffer_progress.processed(),
+                    ConnectionState::BlockedHandshake,
+                );
             }
         };
 

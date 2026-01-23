@@ -113,7 +113,7 @@ pub(crate) struct BufferProgress {
 }
 
 impl BufferProgress {
-    pub(super) fn new(processed: usize) -> Self {
+    pub(crate) fn new(processed: usize) -> Self {
         Self {
             processed,
             discard: 0,

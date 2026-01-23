@@ -325,18 +325,21 @@ impl MessageDecrypter for GcmMessageDecrypter {
         let plaintext_len = msg.payload.len() - GCM_OVERHEAD;
         let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, plaintext_len));
 
-        // Copy ciphertext+tag to output buffer for in-place decryption
-        let ciphertext_len = ciphertext_with_tag.len();
-        if out.len() < ciphertext_len {
+        // Split ciphertext and tag (no copy yet)
+        let tag_len = self.dec_key.algorithm().tag_len();
+        let ciphertext_len = ciphertext_with_tag.len() - tag_len;
+        let (ciphertext, tag) = ciphertext_with_tag.split_at(ciphertext_len);
+
+        if out.len() < plaintext_len {
             return Err(Error::General("output buffer too small".into()));
         }
-        out[..ciphertext_len].copy_from_slice(ciphertext_with_tag);
 
-        let plain_len = self
-            .dec_key
-            .open_in_place(nonce, aad, &mut out[..ciphertext_len])
-            .map_err(|_| Error::DecryptError)?
-            .len();
+        // Zero-copy: decrypt directly from input ciphertext to output buffer
+        self.dec_key
+            .open_separate_gather(nonce, aad, ciphertext, tag, &mut out[..ciphertext_len])
+            .map_err(|_| Error::DecryptError)?;
+
+        let plain_len = ciphertext_len;
 
         if plain_len > MAX_FRAGMENT_LEN {
             return Err(Error::PeerSentOversizedRecord);
@@ -444,18 +447,21 @@ impl MessageDecrypter for ChaCha20Poly1305MessageDecrypter {
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.dec_offset, seq).0);
         let aad = aead::Aad::from(make_tls12_aad(seq, msg.typ, msg.version, plaintext_len));
 
-        // Copy ciphertext to output buffer for in-place decryption
-        let ciphertext_len = msg.payload.len();
-        if out.len() < ciphertext_len {
+        // Split ciphertext and tag (no copy yet)
+        let tag_len = self.dec_key.algorithm().tag_len();
+        let ciphertext_len = msg.payload.len() - tag_len;
+        let (ciphertext, tag) = msg.payload.split_at(ciphertext_len);
+
+        if out.len() < plaintext_len {
             return Err(Error::General("output buffer too small".into()));
         }
-        out[..ciphertext_len].copy_from_slice(&*msg.payload);
 
-        let plain_len = self
-            .dec_key
-            .open_in_place(nonce, aad, &mut out[..ciphertext_len])
-            .map_err(|_| Error::DecryptError)?
-            .len();
+        // Zero-copy: decrypt directly from input ciphertext to output buffer
+        self.dec_key
+            .open_separate_gather(nonce, aad, ciphertext, tag, &mut out[..ciphertext_len])
+            .map_err(|_| Error::DecryptError)?;
+
+        let plain_len = ciphertext_len;
 
         if plain_len > MAX_FRAGMENT_LEN {
             return Err(Error::PeerSentOversizedRecord);
