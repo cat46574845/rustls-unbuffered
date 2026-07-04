@@ -147,6 +147,40 @@ impl RecordLayer {
         }
     }
 
+    /// Try decrypting a record with an explicit read sequence number, without
+    /// mutating the record-layer sequence state.  Callers that decide to accept
+    /// the plaintext must commit the next sequence number with
+    /// `commit_read_seq_after_decrypt`.
+    pub(crate) fn try_decrypt_incoming_to_at<'a>(
+        &mut self,
+        encr: InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<Option<Decrypted<'a>>, Error> {
+        if self.decrypt_state != DirectionState::Active {
+            return Ok(Some(Decrypted {
+                want_close_before_decrypt: false,
+                plaintext: encr.copy_to_plain_message(out)?,
+            }));
+        }
+
+        let want_close_before_decrypt = seq == SEQ_SOFT_LIMIT;
+        let plaintext = self
+            .message_decrypter
+            .decrypt_to(&encr, seq, out)?;
+        Ok(Some(Decrypted {
+            want_close_before_decrypt,
+            plaintext,
+        }))
+    }
+
+    pub(crate) fn commit_read_seq_after_decrypt(&mut self, next_seq: u64) {
+        self.read_seq = next_seq;
+        if !self.has_decrypted {
+            self.has_decrypted = true;
+        }
+    }
+
     /// Encrypt a TLS message.
     ///
     /// `plain` is a TLS message we'd like to send.  This function
