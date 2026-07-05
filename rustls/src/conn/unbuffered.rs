@@ -49,6 +49,40 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
     ) -> UnbufferedStatus<'c, 'c, ClientConnectionData> {
         self.process_tls_records_fast_tail(incoming_tls, outgoing_tls, keep_records)
     }
+
+    /// Return the current inbound TLS record sequence number.
+    ///
+    /// This is intentionally exposed for kernel/DPDK-style external record
+    /// scheduling.  Callers that decrypt records out of order must only commit
+    /// a sequence after the candidate record authenticates and the application
+    /// data has been accepted.
+    pub fn dangerous_read_seq(&self) -> u64 {
+        self.core.common_state.record_layer.read_seq()
+    }
+
+    /// Try decrypting exactly one complete TLS record with an explicit inbound
+    /// record sequence number, without mutating the connection sequence state.
+    ///
+    /// `record` must include the 5-byte TLS record header.  `outgoing_tls`
+    /// receives plaintext on success.  The return value is the plaintext
+    /// payload length after TLS 1.3 inner-content unpadding.
+    pub fn dangerous_try_decrypt_record_to_at(
+        &mut self,
+        record: &[u8],
+        seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        self.try_decrypt_one_record_to_at(record, seq, outgoing_tls)
+    }
+
+    /// Commit the inbound TLS record sequence after an externally scheduled
+    /// decrypt succeeds.
+    pub fn dangerous_commit_read_seq(&mut self, next_seq: u64) {
+        self.core
+            .common_state
+            .record_layer
+            .commit_read_seq_after_decrypt(next_seq);
+    }
 }
 
 impl UnbufferedConnectionCommon<ServerConnectionData> {
@@ -67,6 +101,43 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
 }
 
 impl<Data> UnbufferedConnectionCommon<Data> {
+    fn try_decrypt_one_record_to_at<'a>(
+        &mut self,
+        record: &[u8],
+        seq: u64,
+        outgoing_tls: &'a mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        if !self
+            .core
+            .common_state
+            .may_receive_application_data
+            || hs_buffer_fast_is_active(&self.hs_buffer_fast)
+        {
+            return Ok(None);
+        }
+        let mut iter = DeframerIterImmut::new(record);
+        let message = match iter.next().transpose()? {
+            Some(message) => message,
+            None => return Ok(None),
+        };
+        if iter.bytes_consumed() != record.len() {
+            return Ok(None);
+        }
+        let decrypted = match self
+            .core
+            .common_state
+            .record_layer
+            .try_decrypt_incoming_to_at(message, seq, outgoing_tls)?
+        {
+            Some(decrypted) => decrypted,
+            None => return Ok(None),
+        };
+        if decrypted.plaintext.typ != ContentType::ApplicationData {
+            return Ok(None);
+        }
+        Ok(Some(decrypted.plaintext.payload.len()))
+    }
+
     fn process_tls_records_fast_tail<'c>(
         &'c mut self,
         incoming_tls: &[u8],
