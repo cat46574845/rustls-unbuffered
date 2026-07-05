@@ -11,7 +11,7 @@ use crate::client::ClientConnectionData;
 use crate::msgs::deframer::buffers::{BufferProgress, DeframerSliceBuffer};
 use crate::msgs::deframer::DeframerIterImmut;
 use crate::server::ServerConnectionData;
-use crate::{ContentType, Error, record_layer::Decrypted};
+use crate::{ContentType, Error};
 
 impl UnbufferedConnectionCommon<ClientConnectionData> {
     /// Processes the TLS records in `incoming_tls` buffer until a new [`UnbufferedStatus`] is
@@ -34,20 +34,6 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
         outcoming_tls: &mut [u8],
     ) -> UnbufferedStatus<'c, 'c, ClientConnectionData> {
         self.process_tls_records_fast(incoming_tls, outcoming_tls)
-    }
-
-    /// Like `decrypt_to`, but when the input buffer contains many complete TLS
-    /// records and application data is already established, skip directly to
-    /// the tail window.  The skipped records are accounted for by advancing the
-    /// receive record sequence number only after the target record authenticates
-    /// successfully.
-    pub fn decrypt_to_tail<'c>(
-        &'c mut self,
-        incoming_tls: &[u8],
-        outgoing_tls: &mut [u8],
-        keep_records: usize,
-    ) -> UnbufferedStatus<'c, 'c, ClientConnectionData> {
-        self.process_tls_records_fast_tail(incoming_tls, outgoing_tls, keep_records)
     }
 
     /// Return the current inbound TLS record sequence number.
@@ -136,91 +122,6 @@ impl<Data> UnbufferedConnectionCommon<Data> {
             return Ok(None);
         }
         Ok(Some(decrypted.plaintext.payload.len()))
-    }
-
-    fn process_tls_records_fast_tail<'c>(
-        &'c mut self,
-        incoming_tls: &[u8],
-        outgoing_tls: &mut [u8],
-        keep_records: usize,
-    ) -> UnbufferedStatus<'c, 'c, Data> {
-        assert!(keep_records > 0, "keep_records must be > 0");
-        if !self
-            .core
-            .common_state
-            .may_receive_application_data
-            || hs_buffer_fast_is_active(&self.hs_buffer_fast)
-        {
-            return self.process_tls_records_fast(incoming_tls, outgoing_tls);
-        }
-
-        let (target_start, target_idx) = match tail_record_start(incoming_tls, keep_records) {
-            Ok(Some(value)) => value,
-            Ok(None) => return self.process_tls_records_fast(incoming_tls, outgoing_tls),
-            Err(_) => return self.process_tls_records_fast(incoming_tls, outgoing_tls),
-        };
-        let target_seq = match self
-            .core
-            .common_state
-            .record_layer
-            .read_seq()
-            .checked_add(target_idx as u64)
-        {
-            Some(seq) => seq,
-            None => {
-                return UnbufferedStatus {
-                    discard: 0,
-                    state: Err(Error::General(
-                        "TLS tail skip read sequence overflow".into(),
-                    )),
-                };
-            }
-        };
-
-        let mut iter = DeframerIterImmut::new(&incoming_tls[target_start..]);
-        let message = match iter.next().transpose() {
-            Ok(Some(message)) => message,
-            Ok(None) => return self.process_tls_records_fast(incoming_tls, outgoing_tls),
-            Err(_) => return self.process_tls_records_fast(incoming_tls, outgoing_tls),
-        };
-
-        let decrypted = match self
-            .core
-            .common_state
-            .record_layer
-            .try_decrypt_incoming_to_at(message, target_seq, outgoing_tls)
-        {
-            Ok(Some(decrypted)) => decrypted,
-            Ok(None) => return self.process_tls_records_fast(incoming_tls, outgoing_tls),
-            Err(_) => return self.process_tls_records_fast(incoming_tls, outgoing_tls),
-        };
-
-        let Decrypted {
-            want_close_before_decrypt,
-            plaintext,
-        } = decrypted;
-
-        if plaintext.typ != ContentType::ApplicationData || plaintext.payload.is_empty() {
-            return self.process_tls_records_fast(incoming_tls, outgoing_tls);
-        }
-
-        if want_close_before_decrypt {
-            self.core
-                .common_state
-                .send_close_notify();
-        }
-        self.core
-            .common_state
-            .record_layer
-            .commit_read_seq_after_decrypt(target_seq + 1);
-        self.core.seen_consecutive_empty_fragments = 0;
-
-        UnbufferedStatus {
-            discard: target_start + iter.bytes_consumed(),
-            state: Ok(ConnectionState::FastReadLen(FastReadLen(
-                plaintext.payload.len(),
-            ))),
-        }
     }
 
     fn process_tls_records_common<'c, 'i>(
@@ -499,36 +400,6 @@ impl<Data> UnbufferedConnectionCommon<Data> {
         UnbufferedStatus {
             discard,
             state: Ok(state),
-        }
-    }
-}
-
-fn tail_record_start(
-    incoming_tls: &[u8],
-    keep_records: usize,
-) -> Result<Option<(usize, usize)>, Error> {
-    let mut iter = DeframerIterImmut::new(incoming_tls);
-    let mut record_count = 0usize;
-    loop {
-        match iter.next().transpose()? {
-            Some(_) => record_count += 1,
-            None => break,
-        }
-    }
-
-    if record_count <= keep_records {
-        return Ok(None);
-    }
-
-    let target_idx = record_count - keep_records;
-    let mut iter = DeframerIterImmut::new(incoming_tls);
-    let mut idx = 0usize;
-    loop {
-        let start = iter.bytes_consumed();
-        match iter.next().transpose()? {
-            Some(_) if idx == target_idx => return Ok(Some((start, target_idx))),
-            Some(_) => idx += 1,
-            None => return Ok(None),
         }
     }
 }
