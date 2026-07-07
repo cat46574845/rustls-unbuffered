@@ -12,7 +12,8 @@ use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError};
 use crate::enums::{CipherSuite, ContentType, ProtocolVersion};
 use crate::error::Error;
 use crate::msgs::message::{
-    InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload,
+    InboundPlainMessage, OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage,
+    PrefixedPayload,
 };
 use crate::suites::{CipherSuiteCommon, ConnectionTrafficSecrets, SupportedCipherSuite};
 use crate::tls13::Tls13CipherSuite;
@@ -225,6 +226,70 @@ struct AeadMessageDecrypter {
     iv: Iv,
 }
 
+const TLS_HEADER_SIZE: usize = 5;
+
+fn copy_chunks_to_slice(chunks: &OutboundChunks<'_>, out: &mut [u8]) -> Result<(), Error> {
+    if chunks.len() != out.len() {
+        return Err(Error::General(
+            "output buffer length does not match outbound chunks".into(),
+        ));
+    }
+
+    match chunks {
+        OutboundChunks::Single(chunk) => out.copy_from_slice(chunk),
+        OutboundChunks::Multiple { chunks, start, end } => {
+            let mut source_offset = 0usize;
+            let mut out_offset = 0usize;
+            for chunk in chunks.iter() {
+                let chunk_start = source_offset;
+                let chunk_end = source_offset + chunk.len();
+                source_offset = chunk_end;
+
+                if chunk_end <= *start || chunk_start >= *end {
+                    continue;
+                }
+
+                let copy_start = (*start).saturating_sub(chunk_start);
+                let copy_end = if *end - chunk_start < chunk.len() {
+                    *end - chunk_start
+                } else {
+                    chunk.len()
+                };
+                let len = copy_end - copy_start;
+                out[out_offset..out_offset + len]
+                    .copy_from_slice(&chunk[copy_start..copy_end]);
+                out_offset += len;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_tls13_record(
+    msg: &OutboundPlainMessage<'_>,
+    encrypted_payload_len: usize,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let total_len = TLS_HEADER_SIZE + encrypted_payload_len;
+    if out.len() < total_len {
+        return Err(Error::General(
+            "output buffer too small for TLS 1.3 record".into(),
+        ));
+    }
+
+    out[0] = ContentType::ApplicationData.into();
+    out[1..3].copy_from_slice(&ProtocolVersion::TLSv1_2.to_array());
+    out[3..5].copy_from_slice(&(encrypted_payload_len as u16).to_be_bytes());
+
+    let plaintext_len = msg.payload.len();
+    let body = &mut out[TLS_HEADER_SIZE..TLS_HEADER_SIZE + encrypted_payload_len];
+    copy_chunks_to_slice(&msg.payload, &mut body[..plaintext_len])?;
+    body[plaintext_len] = msg.typ.into();
+
+    Ok(total_len)
+}
+
 impl MessageEncrypter for AeadMessageEncrypter {
     fn encrypt(
         &mut self,
@@ -250,6 +315,29 @@ impl MessageEncrypter for AeadMessageEncrypter {
             ProtocolVersion::TLSv1_2,
             payload,
         ))
+    }
+
+    fn encrypt_to(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<usize, Error> {
+        let plaintext_len = msg.payload.len();
+        let encrypted_payload_len = self.encrypted_payload_len(plaintext_len);
+        let written = prepare_tls13_record(&msg, encrypted_payload_len, outgoing_tls)?;
+        let payload = &mut outgoing_tls[TLS_HEADER_SIZE..written];
+        let seal_len = plaintext_len + 1;
+
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let aad = aead::Aad::from(make_tls13_aad(encrypted_payload_len));
+        let tag = self
+            .enc_key
+            .seal_in_place_separate_tag(nonce, aad, &mut payload[..seal_len])
+            .map_err(|_| Error::EncryptError)?;
+        payload[seal_len..].copy_from_slice(tag.as_ref());
+
+        Ok(written)
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
@@ -363,6 +451,29 @@ impl MessageEncrypter for GcmMessageEncrypter {
             ProtocolVersion::TLSv1_2,
             payload,
         ))
+    }
+
+    fn encrypt_to(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<usize, Error> {
+        let plaintext_len = msg.payload.len();
+        let encrypted_payload_len = self.encrypted_payload_len(plaintext_len);
+        let written = prepare_tls13_record(&msg, encrypted_payload_len, outgoing_tls)?;
+        let payload = &mut outgoing_tls[TLS_HEADER_SIZE..written];
+        let seal_len = plaintext_len + 1;
+
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let aad = aead::Aad::from(make_tls13_aad(encrypted_payload_len));
+        let tag = self
+            .enc_key
+            .seal_in_place_separate_tag(nonce, aad, &mut payload[..seal_len])
+            .map_err(|_| Error::EncryptError)?;
+        payload[seal_len..].copy_from_slice(tag.as_ref());
+
+        Ok(written)
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
@@ -538,7 +649,7 @@ impl KeyType for Len {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::cipher::MessageDecrypter;
+    use crate::crypto::cipher::{MessageDecrypter, MessageEncrypter};
     use crate::msgs::message::InboundOpaqueMessageImmut;
     use crate::msgs::message::OutboundChunks;
     use alloc::format;
@@ -598,12 +709,60 @@ mod tests {
         assert_eq!(result.payload, plaintext);
     }
 
+    #[test]
+    fn test_aead_chacha20_encrypt_to_decrypt_to() {
+        let key_bytes = [0x42u8; 32];
+        let enc_key = aead::LessSafeKey::new(
+            aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key_bytes).unwrap(),
+        );
+        let dec_key = aead::LessSafeKey::new(
+            aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key_bytes).unwrap(),
+        );
+
+        let mut encrypter = AeadMessageEncrypter {
+            enc_key,
+            iv: Iv::new([0x01u8; 12]),
+        };
+        let mut decrypter = AeadMessageDecrypter {
+            dec_key,
+            iv: Iv::new([0x01u8; 12]),
+        };
+        let plaintext = b"direct TLS 1.3 encrypt output";
+        let msg = OutboundPlainMessage {
+            typ: ContentType::ApplicationData,
+            version: ProtocolVersion::TLSv1_3,
+            payload: OutboundChunks::Single(plaintext),
+        };
+
+        let mut encrypted = [0u8; 512];
+        let written = encrypter.encrypt_to(msg, 0, &mut encrypted).unwrap();
+
+        assert_eq!(encrypted[0], u8::from(ContentType::ApplicationData));
+        assert_eq!(&encrypted[1..3], &ProtocolVersion::TLSv1_2.to_array());
+        assert_eq!(
+            u16::from_be_bytes([encrypted[3], encrypted[4]]) as usize,
+            written - TLS_HEADER_SIZE
+        );
+
+        let opaque = InboundOpaqueMessageImmut::new(
+            ContentType::ApplicationData,
+            ProtocolVersion::TLSv1_2,
+            &encrypted[TLS_HEADER_SIZE..written],
+        );
+        let mut out_buf = [0u8; 512];
+        let result = decrypter
+            .decrypt_to(&opaque, 0, &mut out_buf)
+            .unwrap();
+
+        assert_eq!(result.typ, ContentType::ApplicationData);
+        assert_eq!(result.version, ProtocolVersion::TLSv1_3);
+        assert_eq!(result.payload, plaintext);
+    }
+
     /// 測試 AES-128-GCM 的 decrypt_to 基本功能
     #[test]
     fn test_gcm_aes128_decrypt_to() {
         let key_bytes = [0x42u8; 16]; // AES-128 需要 16 字節密鑰
-        let iv = Iv::new([0x01u8; 12]);
-
         let enc_key = aead::TlsRecordSealingKey::new(
             &aead::AES_128_GCM,
             aead::TlsProtocolId::TLS13,
@@ -622,7 +781,10 @@ mod tests {
             enc_key,
             iv: Iv::new([0x01u8; 12]),
         };
-        let mut decrypter = GcmMessageDecrypter { dec_key, iv };
+        let mut decrypter = GcmMessageDecrypter {
+            dec_key,
+            iv: Iv::new([0x01u8; 12]),
+        };
 
         // 加密測試數據
         let plaintext = b"AES-GCM zero-copy test";
@@ -643,6 +805,63 @@ mod tests {
         );
 
         let mut out_buf = [0u8; 16384 + 256];
+        let result = decrypter
+            .decrypt_to(&opaque, 0, &mut out_buf)
+            .unwrap();
+
+        assert_eq!(result.typ, ContentType::ApplicationData);
+        assert_eq!(result.version, ProtocolVersion::TLSv1_3);
+        assert_eq!(result.payload, plaintext);
+    }
+
+    #[test]
+    fn test_gcm_aes128_encrypt_to_decrypt_to() {
+        let key_bytes = [0x42u8; 16];
+
+        let enc_key = aead::TlsRecordSealingKey::new(
+            &aead::AES_128_GCM,
+            aead::TlsProtocolId::TLS13,
+            &key_bytes,
+        )
+        .unwrap();
+        let dec_key = aead::TlsRecordOpeningKey::new(
+            &aead::AES_128_GCM,
+            aead::TlsProtocolId::TLS13,
+            &key_bytes,
+        )
+        .unwrap();
+
+        let mut encrypter = GcmMessageEncrypter {
+            enc_key,
+            iv: Iv::new([0x01u8; 12]),
+        };
+        let mut decrypter = GcmMessageDecrypter {
+            dec_key,
+            iv: Iv::new([0x01u8; 12]),
+        };
+        let plaintext = b"direct AES-GCM TLS record";
+        let msg = OutboundPlainMessage {
+            typ: ContentType::ApplicationData,
+            version: ProtocolVersion::TLSv1_3,
+            payload: OutboundChunks::Single(plaintext),
+        };
+
+        let mut encrypted = [0u8; 512];
+        let written = encrypter.encrypt_to(msg, 0, &mut encrypted).unwrap();
+
+        assert_eq!(encrypted[0], u8::from(ContentType::ApplicationData));
+        assert_eq!(&encrypted[1..3], &ProtocolVersion::TLSv1_2.to_array());
+        assert_eq!(
+            u16::from_be_bytes([encrypted[3], encrypted[4]]) as usize,
+            written - TLS_HEADER_SIZE
+        );
+
+        let opaque = InboundOpaqueMessageImmut::new(
+            ContentType::ApplicationData,
+            ProtocolVersion::TLSv1_2,
+            &encrypted[TLS_HEADER_SIZE..written],
+        );
+        let mut out_buf = [0u8; 512];
         let result = decrypter
             .decrypt_to(&opaque, 0, &mut out_buf)
             .unwrap();

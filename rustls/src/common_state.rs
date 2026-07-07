@@ -638,13 +638,9 @@ impl CommonState {
         }
 
         for m in fragments {
-            let em = self
+            let len = self
                 .record_layer
-                .encrypt_outgoing(m)
-                .encode();
-
-            let len = em.len();
-            outgoing_tls[written..written + len].copy_from_slice(&em);
+                .encrypt_outgoing_to(m, &mut outgoing_tls[written..]);
             written += len;
         }
 

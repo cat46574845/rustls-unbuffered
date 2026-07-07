@@ -198,6 +198,25 @@ impl RecordLayer {
             .unwrap()
     }
 
+    /// Encrypt a TLS message directly into `outgoing_tls`.
+    ///
+    /// This is the same record-layer operation as `encrypt_outgoing`, including
+    /// sequence-number consumption, but lets crypto providers write into the
+    /// caller's buffer without an intermediate owned message.
+    pub(crate) fn encrypt_outgoing_to(
+        &mut self,
+        plain: OutboundPlainMessage<'_>,
+        outgoing_tls: &mut [u8],
+    ) -> usize {
+        debug_assert!(self.encrypt_state == DirectionState::Active);
+        assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
+        let seq = self.write_seq;
+        self.write_seq += 1;
+        self.message_encrypter
+            .encrypt_to(plain, seq, outgoing_tls)
+            .unwrap()
+    }
+
     /// Prepare to use the given `MessageEncrypter` for future message encryption.
     /// It is not used until you call `start_encrypting`.
     pub(crate) fn prepare_message_encrypter(

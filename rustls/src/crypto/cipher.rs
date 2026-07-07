@@ -171,6 +171,27 @@ pub trait MessageEncrypter: Send + Sync {
         seq: u64,
     ) -> Result<OutboundOpaqueMessage, Error>;
 
+    /// Encrypt the given TLS message directly into `outgoing_tls`.
+    ///
+    /// Providers may override this to avoid allocating an intermediate
+    /// `OutboundOpaqueMessage`. The default keeps the existing implementation
+    /// path for providers without a direct writer.
+    fn encrypt_to(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<usize, Error> {
+        let encoded = self.encrypt(msg, seq)?.encode();
+        if encoded.len() > outgoing_tls.len() {
+            return Err(Error::General(
+                "output buffer too small for encrypted TLS record".into(),
+            ));
+        }
+        outgoing_tls[..encoded.len()].copy_from_slice(&encoded);
+        Ok(encoded.len())
+    }
+
     /// Return the length of the ciphertext that results from encrypting plaintext of
     /// length `payload_len`
     fn encrypted_payload_len(&self, payload_len: usize) -> usize;
