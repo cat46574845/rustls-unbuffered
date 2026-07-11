@@ -8,8 +8,9 @@ use crate::common_state::{CommonState, Side};
 use crate::crypto::cipher::{AeadKey, Iv, MessageDecrypter, Tls13AeadAlgorithm};
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError, expand};
 use crate::crypto::{SharedSecret, hash, hmac};
+use crate::enums::ContentType;
 use crate::error::Error;
-use crate::msgs::message::Message;
+use crate::msgs::message::{InboundOpaqueMessageImmut, InboundPlainMessage, Message};
 use crate::suites::PartiallyExtractedSecrets;
 use crate::{ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite, quic};
 
@@ -420,6 +421,7 @@ impl KeyScheduleBeforeFinished {
                 current_client_traffic_secret,
                 current_server_traffic_secret,
                 current_exporter_secret,
+                next_inbound_traffic_key: None,
             },
             KeyScheduleResumption {
                 ks: ks.inner,
@@ -466,7 +468,11 @@ impl KeyScheduleClientBeforeFinished {
             ));
         }
 
-        next.into_traffic(hs_hash)
+        let (mut traffic, resumption) = next.into_traffic(hs_hash);
+        if !common.is_quic() {
+            traffic.prepare_next_inbound_traffic_key(common.side.peer());
+        }
+        (traffic, resumption)
     }
 }
 
@@ -516,6 +522,14 @@ pub(crate) struct KeyScheduleTraffic {
     current_client_traffic_secret: OkmBlock,
     current_server_traffic_secret: OkmBlock,
     current_exporter_secret: OkmBlock,
+    next_inbound_traffic_key: Option<NextInboundTrafficKey>,
+}
+
+struct NextInboundTrafficKey {
+    side: Side,
+    secret: OkmBlock,
+    decrypter: Box<dyn MessageDecrypter>,
+    validated_seq: Option<u64>,
 }
 
 impl KeyScheduleTraffic {
@@ -537,11 +551,17 @@ impl KeyScheduleTraffic {
     }
 
     pub(crate) fn update_decrypter(&mut self, common: &mut CommonState) {
-        let secret = self.next_application_traffic_secret(common.side.peer());
-        self.ks.set_decrypter(&secret, common);
+        let side = common.side.peer();
+        if !self.next_inbound_matches(side) {
+            self.prepare_next_inbound_traffic_key(side);
+        }
+        self.commit_prepared_inbound_traffic_key(side, common, 0);
     }
 
     pub(crate) fn next_application_traffic_secret(&mut self, side: Side) -> OkmBlock {
+        if self.next_inbound_matches(side) {
+            self.next_inbound_traffic_key = None;
+        }
         let current = match side {
             Side::Client => &mut self.current_client_traffic_secret,
             Side::Server => &mut self.current_server_traffic_secret,
@@ -550,6 +570,123 @@ impl KeyScheduleTraffic {
         let secret = self.ks.derive_next(current);
         *current = secret.clone();
         secret
+    }
+
+    pub(crate) fn prepare_next_inbound_traffic_key(&mut self, side: Side) {
+        if self.next_inbound_matches(side) {
+            return;
+        }
+
+        let current = self.current_traffic_secret(side);
+        let secret = self.ks.derive_next(current);
+        let decrypter = self.ks.derive_decrypter(&secret);
+        self.next_inbound_traffic_key = Some(NextInboundTrafficKey {
+            side,
+            secret,
+            decrypter,
+            validated_seq: None,
+        });
+    }
+
+    pub(crate) fn try_decrypt_with_next_inbound_traffic_key<'a>(
+        &mut self,
+        side: Side,
+        message: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        let next = self
+            .next_inbound_traffic_key
+            .as_mut()
+            .filter(|next| next.side == side)
+            .ok_or(Error::HandshakeNotComplete)?;
+
+        let plaintext = next.decrypter.decrypt_to(message, seq, out)?;
+        if plaintext.typ == ContentType::ApplicationData {
+            next.validated_seq = Some(seq);
+        }
+        Ok(plaintext)
+    }
+
+    pub(crate) fn commit_next_inbound_traffic_key(
+        &mut self,
+        side: Side,
+        common: &mut CommonState,
+        matched_seq: u64,
+    ) -> Result<(), Error> {
+        let next_seq = matched_seq.checked_add(1).ok_or_else(|| {
+            Error::General("matched inbound TLS sequence number cannot be incremented".into())
+        })?;
+        let next = self
+            .next_inbound_traffic_key
+            .as_ref()
+            .filter(|next| next.side == side)
+            .ok_or(Error::HandshakeNotComplete)?;
+        if next.validated_seq != Some(matched_seq) {
+            return Err(Error::General(
+                "next inbound traffic key has not authenticated the sequence being committed"
+                    .into(),
+            ));
+        }
+
+        self.commit_prepared_inbound_traffic_key(side, common, next_seq);
+        Ok(())
+    }
+
+    fn commit_prepared_inbound_traffic_key(
+        &mut self,
+        side: Side,
+        common: &mut CommonState,
+        next_seq: u64,
+    ) {
+        let (following_secret, following_decrypter) = {
+            let next = self
+                .next_inbound_traffic_key
+                .as_ref()
+                .filter(|next| next.side == side)
+                .expect("the caller guarantees a prepared inbound traffic key for this side");
+            let following_secret = self.ks.derive_next(&next.secret);
+            let following_decrypter = self.ks.derive_decrypter(&following_secret);
+            (following_secret, following_decrypter)
+        };
+
+        let next = self
+            .next_inbound_traffic_key
+            .take()
+            .expect("the prepared inbound traffic key remains present until commit");
+        *self.current_traffic_secret_mut(side) = next.secret;
+        common
+            .record_layer
+            .set_message_decrypter(next.decrypter);
+        common
+            .record_layer
+            .commit_read_seq_after_decrypt(next_seq);
+        self.next_inbound_traffic_key = Some(NextInboundTrafficKey {
+            side,
+            secret: following_secret,
+            decrypter: following_decrypter,
+            validated_seq: None,
+        });
+    }
+
+    fn next_inbound_matches(&self, side: Side) -> bool {
+        self.next_inbound_traffic_key
+            .as_ref()
+            .is_some_and(|next| next.side == side)
+    }
+
+    fn current_traffic_secret(&self, side: Side) -> &OkmBlock {
+        match side {
+            Side::Client => &self.current_client_traffic_secret,
+            Side::Server => &self.current_server_traffic_secret,
+        }
+    }
+
+    fn current_traffic_secret_mut(&mut self, side: Side) -> &mut OkmBlock {
+        match side {
+            Side::Client => &mut self.current_client_traffic_secret,
+            Side::Server => &mut self.current_server_traffic_secret,
+        }
     }
 
     pub(crate) fn export_keying_material(

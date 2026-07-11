@@ -61,6 +61,24 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
         self.try_decrypt_one_record_to_at(record, seq, outgoing_tls)
     }
 
+    /// Try decrypting exactly one complete TLS 1.3 record with the speculative
+    /// next inbound traffic key and an explicit record sequence number.
+    ///
+    /// This does not switch traffic-key epochs or change the record-layer read
+    /// sequence.  [`Error::DecryptError`] specifically means AEAD authentication
+    /// failed; framing, connection-state, and output-buffer errors remain
+    /// distinguishable through their existing error variants.  After this
+    /// returns application data successfully, the caller may explicitly commit
+    /// that key and sequence with [`Self::dangerous_commit_next_inbound_key`].
+    pub fn dangerous_try_decrypt_record_to_at_with_next_key(
+        &mut self,
+        record: &[u8],
+        seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        self.try_decrypt_one_record_to_at_with_next_key(record, seq, outgoing_tls)
+    }
+
     /// Commit the inbound TLS record sequence after an externally scheduled
     /// decrypt succeeds.
     pub fn dangerous_commit_read_seq(&mut self, next_seq: u64) {
@@ -68,6 +86,25 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
             .common_state
             .record_layer
             .commit_read_seq_after_decrypt(next_seq);
+    }
+
+    /// Commit a successfully authenticated speculative next inbound traffic
+    /// key, then set the read sequence to `matched_seq + 1`.
+    ///
+    /// The commit fails without changing the key epoch or sequence unless the
+    /// same speculative key previously authenticated `matched_seq`.  A
+    /// successful commit also prepares the following inbound traffic key while
+    /// keeping all traffic secrets internal to rustls.
+    pub fn dangerous_commit_next_inbound_key(
+        &mut self,
+        matched_seq: u64,
+    ) -> Result<(), Error> {
+        let state = &mut self.core.state;
+        let common = &mut self.core.common_state;
+        match state {
+            Ok(state) => state.commit_next_inbound_traffic_key(common, matched_seq),
+            Err(error) => Err(error.clone()),
+        }
     }
 }
 
@@ -122,6 +159,42 @@ impl<Data> UnbufferedConnectionCommon<Data> {
             return Ok(None);
         }
         Ok(Some(decrypted.plaintext.payload.len()))
+    }
+
+    fn try_decrypt_one_record_to_at_with_next_key<'a>(
+        &mut self,
+        record: &[u8],
+        seq: u64,
+        outgoing_tls: &'a mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        if !self
+            .core
+            .common_state
+            .may_receive_application_data
+            || hs_buffer_fast_is_active(&self.hs_buffer_fast)
+        {
+            return Ok(None);
+        }
+        let mut iter = DeframerIterImmut::new(record);
+        let message = match iter.next().transpose()? {
+            Some(message) => message,
+            None => return Ok(None),
+        };
+        if iter.bytes_consumed() != record.len() {
+            return Ok(None);
+        }
+        let plaintext = match self.core.state.as_mut() {
+            Ok(state) => state.try_decrypt_with_next_inbound_traffic_key(
+                &message,
+                seq,
+                outgoing_tls,
+            )?,
+            Err(error) => return Err(error.clone()),
+        };
+        if plaintext.typ != ContentType::ApplicationData {
+            return Ok(None);
+        }
+        Ok(Some(plaintext.payload.len()))
     }
 
     fn process_tls_records_common<'c, 'i>(

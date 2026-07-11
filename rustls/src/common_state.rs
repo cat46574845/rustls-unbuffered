@@ -16,8 +16,8 @@ use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::fragmenter::MessageFragmenter;
 use crate::msgs::handshake::{CertificateChain, HandshakeMessagePayload, ProtocolName};
 use crate::msgs::message::{
-    Message, MessagePayload, OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage,
-    PlainMessage,
+    InboundOpaqueMessageImmut, InboundPlainMessage, Message, MessagePayload, OutboundChunks,
+    OutboundOpaqueMessage, OutboundPlainMessage, PlainMessage,
 };
 use crate::record_layer::PreEncryptAction;
 use crate::suites::{PartiallyExtractedSecrets, SupportedCipherSuite};
@@ -862,6 +862,23 @@ pub(crate) trait State<Data>: Send + Sync {
     }
 
     fn send_key_update_request(&mut self, _common: &mut CommonState) -> Result<(), Error> {
+        Err(Error::HandshakeNotComplete)
+    }
+
+    fn try_decrypt_with_next_inbound_traffic_key<'a>(
+        &mut self,
+        _message: &InboundOpaqueMessageImmut<'_>,
+        _seq: u64,
+        _out: &'a mut [u8],
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        Err(Error::HandshakeNotComplete)
+    }
+
+    fn commit_next_inbound_traffic_key(
+        &mut self,
+        _common: &mut CommonState,
+        _matched_seq: u64,
+    ) -> Result<(), Error> {
         Err(Error::HandshakeNotComplete)
     }
 

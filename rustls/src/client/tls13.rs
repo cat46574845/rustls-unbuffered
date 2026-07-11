@@ -34,7 +34,9 @@ use crate::msgs::handshake::{
     PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer, ServerExtensions,
     ServerHelloPayload,
 };
-use crate::msgs::message::{Message, MessagePayload};
+use crate::msgs::message::{
+    InboundOpaqueMessageImmut, InboundPlainMessage, Message, MessagePayload,
+};
 use crate::msgs::persist::{self, Retrieved};
 use crate::sign::{CertifiedKey, Signer};
 use crate::suites::PartiallyExtractedSecrets;
@@ -1599,6 +1601,25 @@ impl State<ClientConnectionData> for ExpectTraffic {
     fn send_key_update_request(&mut self, common: &mut CommonState) -> Result<(), Error> {
         self.key_schedule
             .request_key_update_and_update_encrypter(common)
+    }
+
+    fn try_decrypt_with_next_inbound_traffic_key<'a>(
+        &mut self,
+        message: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        self.key_schedule
+            .try_decrypt_with_next_inbound_traffic_key(Side::Server, message, seq, out)
+    }
+
+    fn commit_next_inbound_traffic_key(
+        &mut self,
+        common: &mut CommonState,
+        matched_seq: u64,
+    ) -> Result<(), Error> {
+        self.key_schedule
+            .commit_next_inbound_traffic_key(Side::Server, common, matched_seq)
     }
 
     fn export_keying_material(
