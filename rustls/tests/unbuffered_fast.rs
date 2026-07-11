@@ -947,6 +947,8 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
         Err(rustls::Error::DecryptError)
     ));
     assert_eq!(client.dangerous_read_seq(), initial_read_seq);
+    assert!(client.dangerous_commit_next_inbound_key(1).is_err());
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
 
     let mut corrupted = generation_one.to_vec();
     let last = corrupted
@@ -962,6 +964,8 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
         Err(rustls::Error::DecryptError)
     ));
     assert_eq!(client.dangerous_read_seq(), initial_read_seq);
+    assert!(client.dangerous_commit_next_inbound_key(0).is_err());
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
 
     let mut undersized = [0u8; 1];
     assert!(matches!(
@@ -972,6 +976,8 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
         ),
         Err(rustls::Error::General(_))
     ));
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
+    assert!(client.dangerous_commit_next_inbound_key(0).is_err());
     assert_eq!(client.dangerous_read_seq(), initial_read_seq);
 
     let len = authenticated_application_data_len(
@@ -990,6 +996,10 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
         Err(rustls::Error::DecryptError)
     ));
 
+    assert!(client
+        .dangerous_commit_next_inbound_key(u64::MAX)
+        .is_err());
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
     assert!(client.dangerous_commit_next_inbound_key(1).is_err());
     assert_eq!(client.dangerous_read_seq(), initial_read_seq);
     client
@@ -1066,6 +1076,175 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
             .expect("the committed second key must be current"),
     );
     assert_eq!(&client_out[..len], b"generation-two-current");
+}
+
+#[test]
+fn fast_standard_client_key_update_uses_prepared_inbound_chain() {
+    let mut outcome = handshake(&rustls::version::TLS13);
+    let mut client = outcome.client.take().unwrap();
+    let mut server = outcome.server.take().unwrap();
+    let mut client_out = [0u8; 16384 + 256];
+    let mut server_out = [0u8; 16384 + 256];
+    let mut key_update = [0u8; 256];
+    let key_update_len = encode_server_key_update(
+        &mut server,
+        &mut server_out,
+        &mut key_update,
+    );
+    let mut generation_one = [0u8; 256];
+    let generation_one_len = encrypt_server_record(
+        &mut server,
+        &mut server_out,
+        b"standard-generation-one",
+        &mut generation_one,
+    );
+
+    process_client_key_update(
+        &mut client,
+        &key_update[..key_update_len],
+        &mut client_out,
+    );
+    assert_eq!(client.dangerous_read_seq(), 0);
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at(
+                &generation_one[..generation_one_len],
+                0,
+                &mut client_out,
+            )
+            .expect("the standard KeyUpdate must install the prepared inbound key"),
+    );
+    assert_eq!(&client_out[..len], b"standard-generation-one");
+    client.dangerous_commit_read_seq(1);
+
+    assert_following_speculative_generation(
+        &mut client,
+        &mut server,
+        &mut client_out,
+        &mut server_out,
+        b"standard-generation-two",
+    );
+}
+
+#[test]
+fn fast_failed_speculative_trial_does_not_split_standard_key_update_chain() {
+    let mut outcome = handshake(&rustls::version::TLS13);
+    let mut client = outcome.client.take().unwrap();
+    let mut server = outcome.server.take().unwrap();
+    let mut client_out = [0u8; 16384 + 256];
+    let mut server_out = [0u8; 16384 + 256];
+    let initial_read_seq = client.dangerous_read_seq();
+    let mut key_update = [0u8; 256];
+    let key_update_len = encode_server_key_update(
+        &mut server,
+        &mut server_out,
+        &mut key_update,
+    );
+    let mut generation_one = [0u8; 256];
+    let generation_one_len = encrypt_server_record(
+        &mut server,
+        &mut server_out,
+        b"failed-trial-generation-one",
+        &mut generation_one,
+    );
+
+    assert!(matches!(
+        client.dangerous_try_decrypt_record_to_at_with_next_key(
+            &generation_one[..generation_one_len],
+            1,
+            &mut client_out,
+        ),
+        Err(rustls::Error::DecryptError)
+    ));
+    assert!(client.dangerous_commit_next_inbound_key(1).is_err());
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
+
+    process_client_key_update(
+        &mut client,
+        &key_update[..key_update_len],
+        &mut client_out,
+    );
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at(
+                &generation_one[..generation_one_len],
+                0,
+                &mut client_out,
+            )
+            .expect("a failed speculative trial must not poison standard KeyUpdate"),
+    );
+    assert_eq!(&client_out[..len], b"failed-trial-generation-one");
+    client.dangerous_commit_read_seq(1);
+
+    assert_following_speculative_generation(
+        &mut client,
+        &mut server,
+        &mut client_out,
+        &mut server_out,
+        b"failed-trial-generation-two",
+    );
+}
+
+#[test]
+fn fast_uncommitted_speculative_success_is_consumed_by_standard_key_update() {
+    let mut outcome = handshake(&rustls::version::TLS13);
+    let mut client = outcome.client.take().unwrap();
+    let mut server = outcome.server.take().unwrap();
+    let mut client_out = [0u8; 16384 + 256];
+    let mut server_out = [0u8; 16384 + 256];
+    let initial_read_seq = client.dangerous_read_seq();
+    let mut key_update = [0u8; 256];
+    let key_update_len = encode_server_key_update(
+        &mut server,
+        &mut server_out,
+        &mut key_update,
+    );
+    let mut generation_one = [0u8; 256];
+    let generation_one_len = encrypt_server_record(
+        &mut server,
+        &mut server_out,
+        b"uncommitted-generation-one",
+        &mut generation_one,
+    );
+
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at_with_next_key(
+                &generation_one[..generation_one_len],
+                0,
+                &mut client_out,
+            )
+            .expect("the speculative next key must authenticate before standard KeyUpdate"),
+    );
+    assert_eq!(&client_out[..len], b"uncommitted-generation-one");
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
+
+    process_client_key_update(
+        &mut client,
+        &key_update[..key_update_len],
+        &mut client_out,
+    );
+    assert!(client.dangerous_commit_next_inbound_key(0).is_err());
+    assert_eq!(client.dangerous_read_seq(), 0);
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at(
+                &generation_one[..generation_one_len],
+                0,
+                &mut client_out,
+            )
+            .expect("standard KeyUpdate must consume the speculative key exactly once"),
+    );
+    assert_eq!(&client_out[..len], b"uncommitted-generation-one");
+    client.dangerous_commit_read_seq(1);
+
+    assert_following_speculative_generation(
+        &mut client,
+        &mut server,
+        &mut client_out,
+        &mut server_out,
+        b"uncommitted-generation-two",
+    );
 }
 
 #[test]
@@ -1197,6 +1376,51 @@ fn authenticated_application_data_len(outcome: DangerousDecryptOutcome) -> usize
         DangerousDecryptOutcome::AuthenticatedApplicationData(len) => len,
         other => panic!("expected authenticated application data, got {other:?}"),
     }
+}
+
+fn process_client_key_update(
+    client: &mut UnbufferedClientConnection,
+    key_update: &[u8],
+    scratch: &mut [u8],
+) {
+    let UnbufferedStatus { discard, state } =
+        client.process_tls_records_fast(key_update, scratch);
+    assert_eq!(discard, key_update.len());
+    match state.expect("the standard client KeyUpdate must process") {
+        ConnectionState::WriteTraffic(_) => {}
+        other => panic!("expected WriteTraffic after server KeyUpdate, got {other:?}"),
+    }
+}
+
+fn assert_following_speculative_generation(
+    client: &mut UnbufferedClientConnection,
+    server: &mut UnbufferedServerConnection,
+    client_scratch: &mut [u8],
+    server_scratch: &mut [u8],
+    expected: &[u8],
+) {
+    drop_server_key_update(server, server_scratch);
+    let mut following = [0u8; 256];
+    let following_len = encrypt_server_record(
+        server,
+        server_scratch,
+        expected,
+        &mut following,
+    );
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at_with_next_key(
+                &following[..following_len],
+                0,
+                client_scratch,
+            )
+            .expect("the following speculative generation must remain prepared"),
+    );
+    assert_eq!(&client_scratch[..len], expected);
+    client
+        .dangerous_commit_next_inbound_key(0)
+        .expect("the following speculative generation must commit");
+    assert_eq!(client.dangerous_read_seq(), 1);
 }
 
 fn drop_server_key_update(
