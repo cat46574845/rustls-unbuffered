@@ -159,6 +159,47 @@ pub trait MessageDecrypter: Send + Sync {
         let _ = (msg, seq, out);
         Err(Error::General("decrypt_to not implemented".into()))
     }
+
+    /// Decrypt into `out` while reporting whether the AEAD authentication step
+    /// completed successfully, even when later TLS 1.3 inner-plaintext parsing
+    /// fails.
+    ///
+    /// Providers must override this method and set `authenticated` immediately
+    /// after the AEAD open succeeds.  The default reports that the operation is
+    /// unsupported instead of guessing whether a decryption error happened
+    /// before or after authentication.
+    fn decrypt_to_with_authentication<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+        authenticated: &mut bool,
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        let _ = (msg, seq, out);
+        *authenticated = false;
+        Err(Error::General(
+            "decrypt_to authentication outcome not implemented".into(),
+        ))
+    }
+}
+
+pub(crate) enum AuthenticatedDecryptionOutcome<'a> {
+    Plaintext(InboundPlainMessage<'a>),
+    Opaque,
+}
+
+pub(crate) fn decrypt_to_with_authentication<'a>(
+    decrypter: &mut dyn MessageDecrypter,
+    msg: &InboundOpaqueMessageImmut<'_>,
+    seq: u64,
+    out: &'a mut [u8],
+) -> Result<AuthenticatedDecryptionOutcome<'a>, Error> {
+    let mut authenticated = false;
+    match decrypter.decrypt_to_with_authentication(msg, seq, out, &mut authenticated) {
+        Ok(plaintext) => Ok(AuthenticatedDecryptionOutcome::Plaintext(plaintext)),
+        Err(_) if authenticated => Ok(AuthenticatedDecryptionOutcome::Opaque),
+        Err(error) => Err(error),
+    }
 }
 
 /// Objects with this trait can encrypt TLS messages.

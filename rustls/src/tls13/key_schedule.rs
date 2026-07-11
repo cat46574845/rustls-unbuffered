@@ -5,12 +5,14 @@ use alloc::string::ToString;
 use core::ops::Deref;
 
 use crate::common_state::{CommonState, Side};
-use crate::crypto::cipher::{AeadKey, Iv, MessageDecrypter, Tls13AeadAlgorithm};
+use crate::crypto::cipher::{
+    AeadKey, AuthenticatedDecryptionOutcome, Iv, MessageDecrypter, Tls13AeadAlgorithm,
+    decrypt_to_with_authentication,
+};
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError, expand};
 use crate::crypto::{SharedSecret, hash, hmac};
-use crate::enums::ContentType;
 use crate::error::Error;
-use crate::msgs::message::{InboundOpaqueMessageImmut, InboundPlainMessage, Message};
+use crate::msgs::message::{InboundOpaqueMessageImmut, Message};
 use crate::suites::PartiallyExtractedSecrets;
 use crate::{ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite, quic};
 
@@ -552,10 +554,12 @@ impl KeyScheduleTraffic {
 
     pub(crate) fn update_decrypter(&mut self, common: &mut CommonState) {
         let side = common.side.peer();
-        if !self.next_inbound_matches(side) {
-            self.prepare_next_inbound_traffic_key(side);
+        if self.next_inbound_matches(side) {
+            self.commit_prepared_inbound_traffic_key(side, common, 0);
+        } else {
+            let secret = self.next_application_traffic_secret(side);
+            self.ks.set_decrypter(&secret, common);
         }
-        self.commit_prepared_inbound_traffic_key(side, common, 0);
     }
 
     pub(crate) fn next_application_traffic_secret(&mut self, side: Side) -> OkmBlock {
@@ -594,18 +598,17 @@ impl KeyScheduleTraffic {
         message: &InboundOpaqueMessageImmut<'_>,
         seq: u64,
         out: &'a mut [u8],
-    ) -> Result<InboundPlainMessage<'a>, Error> {
+    ) -> Result<AuthenticatedDecryptionOutcome<'a>, Error> {
         let next = self
             .next_inbound_traffic_key
             .as_mut()
             .filter(|next| next.side == side)
             .ok_or(Error::HandshakeNotComplete)?;
 
-        let plaintext = next.decrypter.decrypt_to(message, seq, out)?;
-        if plaintext.typ == ContentType::ApplicationData {
-            next.validated_seq = Some(seq);
-        }
-        Ok(plaintext)
+        let outcome =
+            decrypt_to_with_authentication(next.decrypter.as_mut(), message, seq, out)?;
+        next.validated_seq = Some(seq);
+        Ok(outcome)
     }
 
     pub(crate) fn commit_next_inbound_traffic_key(

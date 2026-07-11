@@ -24,9 +24,7 @@ use crate::msgs::handshake::{
     CERTIFICATE_MAX_SIZE_LIMIT, CertificateChain, CertificatePayloadTls13, HandshakeMessagePayload,
     HandshakePayload, NewSessionTicketPayloadTls13,
 };
-use crate::msgs::message::{
-    InboundOpaqueMessageImmut, InboundPlainMessage, Message, MessagePayload,
-};
+use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::server::ServerConfig;
 use crate::suites::PartiallyExtractedSecrets;
@@ -1346,11 +1344,8 @@ impl State<ServerConnectionData> for ExpectFinished {
 
         cx.common.check_aligned_handshake()?;
 
-        let (mut key_schedule_traffic, resumption) =
+        let (key_schedule_traffic, resumption) =
             key_schedule_before_finished.into_traffic(self.transcript.current_hash());
-        if !cx.common.is_quic() {
-            key_schedule_traffic.prepare_next_inbound_traffic_key(cx.common.side.peer());
-        }
 
         let mut flight = HandshakeFlightTls13::new(&mut self.transcript);
         for _ in 0..self.send_tickets {
@@ -1459,25 +1454,6 @@ impl State<ServerConnectionData> for ExpectTraffic {
     fn send_key_update_request(&mut self, common: &mut CommonState) -> Result<(), Error> {
         self.key_schedule
             .request_key_update_and_update_encrypter(common)
-    }
-
-    fn try_decrypt_with_next_inbound_traffic_key<'a>(
-        &mut self,
-        message: &InboundOpaqueMessageImmut<'_>,
-        seq: u64,
-        out: &'a mut [u8],
-    ) -> Result<InboundPlainMessage<'a>, Error> {
-        self.key_schedule
-            .try_decrypt_with_next_inbound_traffic_key(Side::Client, message, seq, out)
-    }
-
-    fn commit_next_inbound_traffic_key(
-        &mut self,
-        common: &mut CommonState,
-        matched_seq: u64,
-    ) -> Result<(), Error> {
-        self.key_schedule
-            .commit_next_inbound_traffic_key(Side::Client, common, matched_seq)
     }
 
     fn into_external_state(self: Box<Self>) -> Result<Box<dyn KernelState + 'static>, Error> {

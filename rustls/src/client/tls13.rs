@@ -16,6 +16,7 @@ use crate::common_state::{
 };
 use crate::conn::ConnectionRandoms;
 use crate::conn::kernel::{Direction, KernelContext, KernelState};
+use crate::crypto::cipher::AuthenticatedDecryptionOutcome;
 use crate::crypto::hash::Hash;
 use crate::crypto::{ActiveKeyExchange, SharedSecret};
 use crate::enums::{
@@ -34,9 +35,7 @@ use crate::msgs::handshake::{
     PresharedKeyBinder, PresharedKeyIdentity, PresharedKeyOffer, ServerExtensions,
     ServerHelloPayload,
 };
-use crate::msgs::message::{
-    InboundOpaqueMessageImmut, InboundPlainMessage, Message, MessagePayload,
-};
+use crate::msgs::message::{InboundOpaqueMessageImmut, Message, MessagePayload};
 use crate::msgs::persist::{self, Retrieved};
 use crate::sign::{CertifiedKey, Signer};
 use crate::suites::PartiallyExtractedSecrets;
@@ -1608,7 +1607,7 @@ impl State<ClientConnectionData> for ExpectTraffic {
         message: &InboundOpaqueMessageImmut<'_>,
         seq: u64,
         out: &'a mut [u8],
-    ) -> Result<InboundPlainMessage<'a>, Error> {
+    ) -> Result<AuthenticatedDecryptionOutcome<'a>, Error> {
         self.key_schedule
             .try_decrypt_with_next_inbound_traffic_key(Side::Server, message, seq, out)
     }

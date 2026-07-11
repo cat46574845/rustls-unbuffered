@@ -8,10 +8,22 @@ use std::error::Error as StdError;
 
 use super::{UnbufferedConnectionCommon, hs_buffer_fast_is_active};
 use crate::client::ClientConnectionData;
+use crate::crypto::cipher::AuthenticatedDecryptionOutcome;
 use crate::msgs::deframer::buffers::{BufferProgress, DeframerSliceBuffer};
 use crate::msgs::deframer::DeframerIterImmut;
 use crate::server::ServerConnectionData;
 use crate::{ContentType, Error};
+
+/// Result of an explicit-sequence dangerous TLS-record authentication trial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DangerousDecryptOutcome {
+    /// The input does not contain exactly one complete TLS record.
+    NoCompleteSingleRecord,
+    /// AEAD authentication succeeded and yielded TLS application data.
+    AuthenticatedApplicationData(usize),
+    /// AEAD authentication succeeded, but the inner plaintext is opaque to this API.
+    AuthenticatedOpaque,
+}
 
 impl UnbufferedConnectionCommon<ClientConnectionData> {
     /// Processes the TLS records in `incoming_tls` buffer until a new [`UnbufferedStatus`] is
@@ -39,9 +51,9 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
     /// Return the current inbound TLS record sequence number.
     ///
     /// This is intentionally exposed for kernel/DPDK-style external record
-    /// scheduling.  Callers that decrypt records out of order must only commit
-    /// a sequence after the candidate record authenticates and the application
-    /// data has been accepted.
+    /// scheduling.  Callers that decrypt records out of order must commit a
+    /// sequence as soon as the candidate record authenticates, before parsing
+    /// or accepting application data.
     pub fn dangerous_read_seq(&self) -> u64 {
         self.core.common_state.record_layer.read_seq()
     }
@@ -50,14 +62,15 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
     /// record sequence number, without mutating the connection sequence state.
     ///
     /// `record` must include the 5-byte TLS record header.  `outgoing_tls`
-    /// receives plaintext on success.  The return value is the plaintext
-    /// payload length after TLS 1.3 inner-content unpadding.
+    /// receives plaintext when the authenticated record contains application
+    /// data.  Every authenticated outcome requires the caller to commit
+    /// `seq + 1`, including [`DangerousDecryptOutcome::AuthenticatedOpaque`].
     pub fn dangerous_try_decrypt_record_to_at(
         &mut self,
         record: &[u8],
         seq: u64,
         outgoing_tls: &mut [u8],
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<DangerousDecryptOutcome, Error> {
         self.try_decrypt_one_record_to_at(record, seq, outgoing_tls)
     }
 
@@ -65,17 +78,18 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
     /// next inbound traffic key and an explicit record sequence number.
     ///
     /// This does not switch traffic-key epochs or change the record-layer read
-    /// sequence.  [`Error::DecryptError`] specifically means AEAD authentication
-    /// failed; framing, connection-state, and output-buffer errors remain
-    /// distinguishable through their existing error variants.  After this
-    /// returns application data successfully, the caller may explicitly commit
-    /// that key and sequence with [`Self::dangerous_commit_next_inbound_key`].
+    /// sequence.  Every authenticated outcome leaves an internal proof for
+    /// `seq`, including authenticated TLS inner plaintext this API treats as
+    /// opaque.  The caller must then commit that key and sequence with
+    /// [`Self::dangerous_commit_next_inbound_key`] before interpreting any
+    /// application data.  Authentication failures leave no new proof or key
+    /// state.
     pub fn dangerous_try_decrypt_record_to_at_with_next_key(
         &mut self,
         record: &[u8],
         seq: u64,
         outgoing_tls: &mut [u8],
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<DangerousDecryptOutcome, Error> {
         self.try_decrypt_one_record_to_at_with_next_key(record, seq, outgoing_tls)
     }
 
@@ -129,36 +143,39 @@ impl<Data> UnbufferedConnectionCommon<Data> {
         record: &[u8],
         seq: u64,
         outgoing_tls: &'a mut [u8],
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<DangerousDecryptOutcome, Error> {
         if !self
             .core
             .common_state
             .may_receive_application_data
             || hs_buffer_fast_is_active(&self.hs_buffer_fast)
         {
-            return Ok(None);
+            return Err(Error::HandshakeNotComplete);
         }
         let mut iter = DeframerIterImmut::new(record);
         let message = match iter.next().transpose()? {
             Some(message) => message,
-            None => return Ok(None),
+            None => return Ok(DangerousDecryptOutcome::NoCompleteSingleRecord),
         };
         if iter.bytes_consumed() != record.len() {
-            return Ok(None);
+            return Ok(DangerousDecryptOutcome::NoCompleteSingleRecord);
         }
-        let decrypted = match self
+        let outcome = self
             .core
             .common_state
             .record_layer
-            .try_decrypt_incoming_to_at(message, seq, outgoing_tls)?
-        {
-            Some(decrypted) => decrypted,
-            None => return Ok(None),
-        };
-        if decrypted.plaintext.typ != ContentType::ApplicationData {
-            return Ok(None);
-        }
-        Ok(Some(decrypted.plaintext.payload.len()))
+            .try_decrypt_incoming_to_at(message, seq, outgoing_tls)?;
+        Ok(match outcome {
+            AuthenticatedDecryptionOutcome::Plaintext(plaintext)
+                if plaintext.typ == ContentType::ApplicationData =>
+            {
+                DangerousDecryptOutcome::AuthenticatedApplicationData(plaintext.payload.len())
+            }
+            AuthenticatedDecryptionOutcome::Plaintext(_)
+            | AuthenticatedDecryptionOutcome::Opaque => {
+                DangerousDecryptOutcome::AuthenticatedOpaque
+            }
+        })
     }
 
     fn try_decrypt_one_record_to_at_with_next_key<'a>(
@@ -166,24 +183,24 @@ impl<Data> UnbufferedConnectionCommon<Data> {
         record: &[u8],
         seq: u64,
         outgoing_tls: &'a mut [u8],
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<DangerousDecryptOutcome, Error> {
         if !self
             .core
             .common_state
             .may_receive_application_data
             || hs_buffer_fast_is_active(&self.hs_buffer_fast)
         {
-            return Ok(None);
+            return Err(Error::HandshakeNotComplete);
         }
         let mut iter = DeframerIterImmut::new(record);
         let message = match iter.next().transpose()? {
             Some(message) => message,
-            None => return Ok(None),
+            None => return Ok(DangerousDecryptOutcome::NoCompleteSingleRecord),
         };
         if iter.bytes_consumed() != record.len() {
-            return Ok(None);
+            return Ok(DangerousDecryptOutcome::NoCompleteSingleRecord);
         }
-        let plaintext = match self.core.state.as_mut() {
+        let outcome = match self.core.state.as_mut() {
             Ok(state) => state.try_decrypt_with_next_inbound_traffic_key(
                 &message,
                 seq,
@@ -191,10 +208,17 @@ impl<Data> UnbufferedConnectionCommon<Data> {
             )?,
             Err(error) => return Err(error.clone()),
         };
-        if plaintext.typ != ContentType::ApplicationData {
-            return Ok(None);
-        }
-        Ok(Some(plaintext.payload.len()))
+        Ok(match outcome {
+            AuthenticatedDecryptionOutcome::Plaintext(plaintext)
+                if plaintext.typ == ContentType::ApplicationData =>
+            {
+                DangerousDecryptOutcome::AuthenticatedApplicationData(plaintext.payload.len())
+            }
+            AuthenticatedDecryptionOutcome::Plaintext(_)
+            | AuthenticatedDecryptionOutcome::Opaque => {
+                DangerousDecryptOutcome::AuthenticatedOpaque
+            }
+        })
     }
 
     fn process_tls_records_common<'c, 'i>(

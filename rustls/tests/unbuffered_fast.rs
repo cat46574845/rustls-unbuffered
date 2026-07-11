@@ -11,8 +11,8 @@ use std::num::NonZeroUsize;
 use rustls::client::{ClientConnectionData, EarlyDataError, UnbufferedClientConnection};
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{
-    ConnectionState, EncodeError, EncryptError, FastReadLen, InsufficientSizeError,
-    UnbufferedConnectionCommon, UnbufferedStatus, WriteTraffic,
+    ConnectionState, DangerousDecryptOutcome, EncodeError, EncryptError, FastReadLen,
+    InsufficientSizeError, UnbufferedConnectionCommon, UnbufferedStatus, WriteTraffic,
 };
 use rustls::{CertificateError, ClientConfig, ServerConfig, SideData};
 
@@ -974,14 +974,15 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
     ));
     assert_eq!(client.dangerous_read_seq(), initial_read_seq);
 
-    let len = client
-        .dangerous_try_decrypt_record_to_at_with_next_key(
-            generation_one,
-            0,
-            &mut client_out,
-        )
-        .expect("the first speculative traffic key must decrypt")
-        .expect("the decrypted record must contain application data");
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at_with_next_key(
+                generation_one,
+                0,
+                &mut client_out,
+            )
+            .expect("the first speculative traffic key must decrypt"),
+    );
     assert_eq!(&client_out[..len], b"generation-one");
     assert_eq!(client.dangerous_read_seq(), initial_read_seq);
     assert!(matches!(
@@ -1003,14 +1004,15 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
         b"generation-one-current",
         &mut generation_one_current,
     );
-    let len = client
-        .dangerous_try_decrypt_record_to_at(
-            &generation_one_current[..generation_one_current_len],
-            1,
-            &mut client_out,
-        )
-        .expect("the committed first key must be current")
-        .expect("the decrypted record must contain application data");
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at(
+                &generation_one_current[..generation_one_current_len],
+                1,
+                &mut client_out,
+            )
+            .expect("the committed first key must be current"),
+    );
     assert_eq!(&client_out[..len], b"generation-one-current");
     client.dangerous_commit_read_seq(2);
 
@@ -1031,14 +1033,15 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
     ));
     assert_eq!(client.dangerous_read_seq(), 2);
 
-    let len = client
-        .dangerous_try_decrypt_record_to_at_with_next_key(
-            generation_two,
-            0,
-            &mut client_out,
-        )
-        .expect("the second speculative traffic key must decrypt")
-        .expect("the decrypted record must contain application data");
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at_with_next_key(
+                generation_two,
+                0,
+                &mut client_out,
+            )
+            .expect("the second speculative traffic key must decrypt"),
+    );
     assert_eq!(&client_out[..len], b"generation-two");
     assert_eq!(client.dangerous_read_seq(), 2);
     client
@@ -1053,21 +1056,162 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
         b"generation-two-current",
         &mut generation_two_current,
     );
-    let len = client
-        .dangerous_try_decrypt_record_to_at(
-            &generation_two_current[..generation_two_current_len],
-            1,
-            &mut client_out,
-        )
-        .expect("the committed second key must be current")
-        .expect("the decrypted record must contain application data");
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at(
+                &generation_two_current[..generation_two_current_len],
+                1,
+                &mut client_out,
+            )
+            .expect("the committed second key must be current"),
+    );
     assert_eq!(&client_out[..len], b"generation-two-current");
+}
+
+#[test]
+fn fast_current_key_update_and_next_key_app_data_share_one_tail_chain() {
+    let mut outcome = handshake(&rustls::version::TLS13);
+    let mut client = outcome.client.take().unwrap();
+    let mut server = outcome.server.take().unwrap();
+    let mut client_out = [0u8; 16384 + 256];
+    let mut server_out = [0u8; 16384 + 256];
+    let mut tail_packet = [0u8; 512];
+    let current_seq = client.dangerous_read_seq();
+
+    let key_update_len = encode_server_key_update(
+        &mut server,
+        &mut server_out,
+        &mut tail_packet,
+    );
+    let next_app_len = encrypt_server_record(
+        &mut server,
+        &mut server_out,
+        b"next-key-tail-app-data",
+        &mut tail_packet[key_update_len..],
+    );
+    let tail_packet = &tail_packet[..key_update_len + next_app_len];
+    let (current_key_update, next_key_app_data) = tail_packet.split_at(key_update_len);
+
+    assert_eq!(
+        client
+            .dangerous_try_decrypt_record_to_at(tail_packet, current_seq, &mut client_out)
+            .expect("a multi-record tail packet is a valid framing outcome"),
+        DangerousDecryptOutcome::NoCompleteSingleRecord,
+    );
+    assert_eq!(
+        client
+            .dangerous_try_decrypt_record_to_at(current_key_update, current_seq, &mut client_out)
+            .expect("the current-key KeyUpdate must authenticate"),
+        DangerousDecryptOutcome::AuthenticatedOpaque,
+    );
+    client.dangerous_commit_read_seq(current_seq + 1);
+
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at_with_next_key(
+                next_key_app_data,
+                0,
+                &mut client_out,
+            )
+            .expect("the next-key application record must authenticate"),
+    );
+    assert_eq!(&client_out[..len], b"next-key-tail-app-data");
+    client
+        .dangerous_commit_next_inbound_key(0)
+        .expect("the opaque current record must not block next-key commit");
+    assert_eq!(client.dangerous_read_seq(), 1);
+}
+
+#[test]
+fn fast_authenticated_opaque_next_key_commits_and_prepares_following_generation() {
+    let mut outcome = handshake(&rustls::version::TLS13);
+    let mut client = outcome.client.take().unwrap();
+    let mut server = outcome.server.take().unwrap();
+    let mut client_out = [0u8; 16384 + 256];
+    let mut server_out = [0u8; 16384 + 256];
+    let initial_read_seq = client.dangerous_read_seq();
+
+    drop_server_key_update(&mut server, &mut server_out);
+
+    let mut next_key_update = [0u8; 256];
+    let next_key_update_len = encode_server_key_update(
+        &mut server,
+        &mut server_out,
+        &mut next_key_update,
+    );
+    assert_eq!(
+        client
+            .dangerous_try_decrypt_record_to_at_with_next_key(
+                &next_key_update[..next_key_update_len],
+                0,
+                &mut client_out,
+            )
+            .expect("the next-key KeyUpdate must authenticate"),
+        DangerousDecryptOutcome::AuthenticatedOpaque,
+    );
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
+    let mut corrupted = next_key_update[..next_key_update_len].to_vec();
+    let last = corrupted
+        .last_mut()
+        .expect("the encrypted KeyUpdate contains an authentication tag");
+    *last ^= 1;
+    assert!(matches!(
+        client.dangerous_try_decrypt_record_to_at_with_next_key(
+            &corrupted,
+            0,
+            &mut client_out,
+        ),
+        Err(rustls::Error::DecryptError)
+    ));
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
+    client
+        .dangerous_commit_next_inbound_key(0)
+        .expect("a later authentication failure must preserve the opaque commit proof");
+    assert_eq!(client.dangerous_read_seq(), 1);
+
+    let mut following_generation = [0u8; 256];
+    let following_generation_len = encrypt_server_record(
+        &mut server,
+        &mut server_out,
+        b"following-generation",
+        &mut following_generation,
+    );
+    let len = authenticated_application_data_len(
+        client
+            .dangerous_try_decrypt_record_to_at_with_next_key(
+                &following_generation[..following_generation_len],
+                0,
+                &mut client_out,
+            )
+            .expect("the following speculative generation must authenticate"),
+    );
+    assert_eq!(&client_out[..len], b"following-generation");
+    client
+        .dangerous_commit_next_inbound_key(0)
+        .expect("the following speculative generation must commit");
+    assert_eq!(client.dangerous_read_seq(), 1);
+}
+
+fn authenticated_application_data_len(outcome: DangerousDecryptOutcome) -> usize {
+    match outcome {
+        DangerousDecryptOutcome::AuthenticatedApplicationData(len) => len,
+        other => panic!("expected authenticated application data, got {other:?}"),
+    }
 }
 
 fn drop_server_key_update(
     server: &mut UnbufferedServerConnection,
     scratch: &mut [u8],
 ) {
+    let mut discarded = [0u8; 256];
+    let _ = encode_server_key_update(server, scratch, &mut discarded);
+}
+
+fn encode_server_key_update(
+    server: &mut UnbufferedServerConnection,
+    scratch: &mut [u8],
+    record: &mut [u8],
+) -> usize {
     match server
         .process_tls_records_fast(&[], scratch)
         .state
@@ -1090,6 +1234,7 @@ fn drop_server_key_update(
         other => panic!("expected EncodeTlsData for key update, got {other:?}"),
     };
     assert!(encoded > 0, "the KeyUpdate record must not be empty");
+    record[..encoded].copy_from_slice(&scratch[..encoded]);
 
     match server
         .process_tls_records_fast(&[], scratch)
@@ -1099,6 +1244,7 @@ fn drop_server_key_update(
         ConnectionState::TransmitTlsData(transmit) => transmit.done(),
         other => panic!("expected TransmitTlsData for key update, got {other:?}"),
     }
+    encoded
 }
 
 fn encrypt_server_record(

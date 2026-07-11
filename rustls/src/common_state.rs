@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use pki_types::CertificateDer;
 
 use crate::conn::kernel::KernelState;
+use crate::crypto::cipher::AuthenticatedDecryptionOutcome;
 use crate::crypto::SupportedKxGroup;
 use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{Error, InvalidMessage, PeerMisbehaved};
@@ -16,8 +17,8 @@ use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::fragmenter::MessageFragmenter;
 use crate::msgs::handshake::{CertificateChain, HandshakeMessagePayload, ProtocolName};
 use crate::msgs::message::{
-    InboundOpaqueMessageImmut, InboundPlainMessage, Message, MessagePayload, OutboundChunks,
-    OutboundOpaqueMessage, OutboundPlainMessage, PlainMessage,
+    InboundOpaqueMessageImmut, Message, MessagePayload, OutboundChunks, OutboundOpaqueMessage,
+    OutboundPlainMessage, PlainMessage,
 };
 use crate::record_layer::PreEncryptAction;
 use crate::suites::{PartiallyExtractedSecrets, SupportedCipherSuite};
@@ -870,7 +871,7 @@ pub(crate) trait State<Data>: Send + Sync {
         _message: &InboundOpaqueMessageImmut<'_>,
         _seq: u64,
         _out: &'a mut [u8],
-    ) -> Result<InboundPlainMessage<'a>, Error> {
+    ) -> Result<AuthenticatedDecryptionOutcome<'a>, Error> {
         Err(Error::HandshakeNotComplete)
     }
 

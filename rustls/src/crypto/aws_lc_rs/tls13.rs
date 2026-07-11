@@ -345,6 +345,68 @@ impl MessageEncrypter for AeadMessageEncrypter {
     }
 }
 
+impl AeadMessageDecrypter {
+    #[inline(always)]
+    fn decrypt_to_notifying_authentication<'a, F>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+        authenticated: F,
+    ) -> Result<InboundPlainMessage<'a>, Error>
+    where
+        F: FnOnce(),
+    {
+        let tag_len = self.dec_key.algorithm().tag_len();
+        if msg.payload.len() < tag_len {
+            return Err(Error::DecryptError);
+        }
+
+        // Split ciphertext and tag (no copy yet)
+        let ciphertext_len = msg.payload.len() - tag_len;
+        let (ciphertext, tag) = msg.payload.split_at(ciphertext_len);
+
+        if out.len() < ciphertext_len {
+            return Err(Error::General("output buffer too small".into()));
+        }
+
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let aad = aead::Aad::from(make_tls13_aad(msg.payload.len()));
+
+        // Zero-copy: decrypt directly from input ciphertext to output buffer
+        self.dec_key
+            .open_separate_gather(nonce, aad, ciphertext, tag, &mut out[..ciphertext_len])
+            .map_err(|_| Error::DecryptError)?;
+        authenticated();
+
+        let plain_len = ciphertext_len;
+
+        // TLS 1.3: remove padding and extract content type from end
+        // Find the real content type (last non-zero byte)
+        let mut content_type_byte = 0u8;
+        let mut actual_len = plain_len;
+        for i in (0..plain_len).rev() {
+            if out[i] != 0 {
+                content_type_byte = out[i];
+                actual_len = i;
+                break;
+            }
+        }
+
+        let typ = ContentType::from(content_type_byte);
+        if typ == ContentType::Unknown(0) {
+            return Err(Error::DecryptError);
+        }
+
+        Ok(InboundPlainMessage {
+            typ,
+            // TLS 1.3: must set version to TLSv1_3 for correct handshake parsing
+            version: ProtocolVersion::TLSv1_3,
+            payload: &out[..actual_len],
+        })
+    }
+}
+
 impl MessageDecrypter for AeadMessageDecrypter {
     fn decrypt<'a>(
         &mut self,
@@ -374,52 +436,18 @@ impl MessageDecrypter for AeadMessageDecrypter {
         seq: u64,
         out: &'a mut [u8],
     ) -> Result<InboundPlainMessage<'a>, Error> {
-        let tag_len = self.dec_key.algorithm().tag_len();
-        if msg.payload.len() < tag_len {
-            return Err(Error::DecryptError);
-        }
+        self.decrypt_to_notifying_authentication(msg, seq, out, || {})
+    }
 
-        // Split ciphertext and tag (no copy yet)
-        let ciphertext_len = msg.payload.len() - tag_len;
-        let (ciphertext, tag) = msg.payload.split_at(ciphertext_len);
-
-        if out.len() < ciphertext_len {
-            return Err(Error::General("output buffer too small".into()));
-        }
-
-        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(msg.payload.len()));
-
-        // Zero-copy: decrypt directly from input ciphertext to output buffer
-        self.dec_key
-            .open_separate_gather(nonce, aad, ciphertext, tag, &mut out[..ciphertext_len])
-            .map_err(|_| Error::DecryptError)?;
-
-        let plain_len = ciphertext_len;
-
-        // TLS 1.3: remove padding and extract content type from end
-        // Find the real content type (last non-zero byte)
-        let mut content_type_byte = 0u8;
-        let mut actual_len = plain_len;
-        for i in (0..plain_len).rev() {
-            if out[i] != 0 {
-                content_type_byte = out[i];
-                actual_len = i;
-                break;
-            }
-        }
-
-        let typ = ContentType::from(content_type_byte);
-        if typ == ContentType::Unknown(0) {
-            return Err(Error::DecryptError);
-        }
-
-        Ok(InboundPlainMessage {
-            typ,
-            // TLS 1.3: must set version to TLSv1_3 for correct handshake parsing
-            version: ProtocolVersion::TLSv1_3,
-            payload: &out[..actual_len],
-        })
+    fn decrypt_to_with_authentication<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+        authenticated: &mut bool,
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        *authenticated = false;
+        self.decrypt_to_notifying_authentication(msg, seq, out, || *authenticated = true)
     }
 }
 
@@ -486,6 +514,67 @@ struct GcmMessageDecrypter {
     iv: Iv,
 }
 
+impl GcmMessageDecrypter {
+    #[inline(always)]
+    fn decrypt_to_notifying_authentication<'a, F>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+        authenticated: F,
+    ) -> Result<InboundPlainMessage<'a>, Error>
+    where
+        F: FnOnce(),
+    {
+        let tag_len = self.dec_key.algorithm().tag_len();
+        if msg.payload.len() < tag_len {
+            return Err(Error::DecryptError);
+        }
+
+        // Split ciphertext and tag (no copy yet)
+        let ciphertext_len = msg.payload.len() - tag_len;
+        let (ciphertext, tag) = msg.payload.split_at(ciphertext_len);
+
+        if out.len() < ciphertext_len {
+            return Err(Error::General("output buffer too small".into()));
+        }
+
+        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
+        let aad = aead::Aad::from(make_tls13_aad(msg.payload.len()));
+
+        // Zero-copy: decrypt directly from input ciphertext to output buffer
+        self.dec_key
+            .open_separate_gather(nonce, aad, ciphertext, tag, &mut out[..ciphertext_len])
+            .map_err(|_| Error::DecryptError)?;
+        authenticated();
+
+        let plain_len = ciphertext_len;
+
+        // TLS 1.3: remove padding and extract content type from end
+        let mut content_type_byte = 0u8;
+        let mut actual_len = plain_len;
+        for i in (0..plain_len).rev() {
+            if out[i] != 0 {
+                content_type_byte = out[i];
+                actual_len = i;
+                break;
+            }
+        }
+
+        let typ = ContentType::from(content_type_byte);
+        if typ == ContentType::Unknown(0) {
+            return Err(Error::DecryptError);
+        }
+
+        Ok(InboundPlainMessage {
+            typ,
+            // TLS 1.3: must set version to TLSv1_3 for correct handshake parsing
+            version: ProtocolVersion::TLSv1_3,
+            payload: &out[..actual_len],
+        })
+    }
+}
+
 impl MessageDecrypter for GcmMessageDecrypter {
     fn decrypt<'a>(
         &mut self,
@@ -515,51 +604,18 @@ impl MessageDecrypter for GcmMessageDecrypter {
         seq: u64,
         out: &'a mut [u8],
     ) -> Result<InboundPlainMessage<'a>, Error> {
-        let tag_len = self.dec_key.algorithm().tag_len();
-        if msg.payload.len() < tag_len {
-            return Err(Error::DecryptError);
-        }
+        self.decrypt_to_notifying_authentication(msg, seq, out, || {})
+    }
 
-        // Split ciphertext and tag (no copy yet)
-        let ciphertext_len = msg.payload.len() - tag_len;
-        let (ciphertext, tag) = msg.payload.split_at(ciphertext_len);
-
-        if out.len() < ciphertext_len {
-            return Err(Error::General("output buffer too small".into()));
-        }
-
-        let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
-        let aad = aead::Aad::from(make_tls13_aad(msg.payload.len()));
-
-        // Zero-copy: decrypt directly from input ciphertext to output buffer
-        self.dec_key
-            .open_separate_gather(nonce, aad, ciphertext, tag, &mut out[..ciphertext_len])
-            .map_err(|_| Error::DecryptError)?;
-
-        let plain_len = ciphertext_len;
-
-        // TLS 1.3: remove padding and extract content type from end
-        let mut content_type_byte = 0u8;
-        let mut actual_len = plain_len;
-        for i in (0..plain_len).rev() {
-            if out[i] != 0 {
-                content_type_byte = out[i];
-                actual_len = i;
-                break;
-            }
-        }
-
-        let typ = ContentType::from(content_type_byte);
-        if typ == ContentType::Unknown(0) {
-            return Err(Error::DecryptError);
-        }
-
-        Ok(InboundPlainMessage {
-            typ,
-            // TLS 1.3: must set version to TLSv1_3 for correct handshake parsing
-            version: ProtocolVersion::TLSv1_3,
-            payload: &out[..actual_len],
-        })
+    fn decrypt_to_with_authentication<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        seq: u64,
+        out: &'a mut [u8],
+        authenticated: &mut bool,
+    ) -> Result<InboundPlainMessage<'a>, Error> {
+        *authenticated = false;
+        self.decrypt_to_notifying_authentication(msg, seq, out, || *authenticated = true)
     }
 }
 
@@ -649,7 +705,10 @@ impl KeyType for Len {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::cipher::{MessageDecrypter, MessageEncrypter};
+    use crate::crypto::cipher::{
+        AuthenticatedDecryptionOutcome, MessageDecrypter, MessageEncrypter,
+        decrypt_to_with_authentication,
+    };
     use crate::msgs::message::InboundOpaqueMessageImmut;
     use crate::msgs::message::OutboundChunks;
     use alloc::format;
@@ -1161,5 +1220,49 @@ mod tests {
         // 驗證 content type 正確恢復為 Handshake
         assert_eq!(result.typ, ContentType::Handshake);
         assert_eq!(result.payload, plaintext);
+    }
+
+    #[test]
+    fn test_post_authentication_inner_error_is_opaque() {
+        let chacha = Chacha20Poly1305Aead(AeadAlgorithm(&aead::CHACHA20_POLY1305));
+        assert_post_authentication_inner_error_is_opaque(&chacha, 32);
+
+        let aes128 = Aes128GcmAead(AeadAlgorithm(&aead::AES_128_GCM));
+        assert_post_authentication_inner_error_is_opaque(&aes128, 16);
+    }
+
+    fn assert_post_authentication_inner_error_is_opaque(
+        algorithm: &dyn Tls13AeadAlgorithm,
+        key_len: usize,
+    ) {
+        let mut encrypter = algorithm.encrypter(
+            AeadKey::from([0x42u8; 32]).with_length(key_len),
+            Iv::from([0x01u8; 12]),
+        );
+        let mut decrypter = algorithm.decrypter(
+            AeadKey::from([0x42u8; 32]).with_length(key_len),
+            Iv::from([0x01u8; 12]),
+        );
+        let encrypted = encrypter
+            .encrypt(
+                OutboundPlainMessage {
+                    typ: ContentType::Unknown(0),
+                    version: ProtocolVersion::TLSv1_3,
+                    payload: OutboundChunks::new_empty(),
+                },
+                0,
+            )
+            .expect("the invalid inner content type is encrypted for the authentication test");
+        let opaque = InboundOpaqueMessageImmut::new(
+            encrypted.typ,
+            ProtocolVersion::TLSv1_2,
+            encrypted.payload.as_ref(),
+        );
+        let mut out = [0u8; 64];
+
+        assert!(matches!(
+            decrypt_to_with_authentication(decrypter.as_mut(), &opaque, 0, &mut out),
+            Ok(AuthenticatedDecryptionOutcome::Opaque)
+        ));
     }
 }

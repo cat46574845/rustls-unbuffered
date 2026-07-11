@@ -1,7 +1,10 @@
 use alloc::boxed::Box;
 use core::cmp::min;
 
-use crate::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter, MessageEncrypter};
+use crate::crypto::cipher::{
+    AuthenticatedDecryptionOutcome, InboundOpaqueMessage, MessageDecrypter, MessageEncrypter,
+    decrypt_to_with_authentication,
+};
 use crate::error::Error;
 use crate::log::trace;
 use crate::msgs::message::{
@@ -156,22 +159,12 @@ impl RecordLayer {
         encr: InboundOpaqueMessageImmut<'_>,
         seq: u64,
         out: &'a mut [u8],
-    ) -> Result<Option<Decrypted<'a>>, Error> {
+    ) -> Result<AuthenticatedDecryptionOutcome<'a>, Error> {
         if self.decrypt_state != DirectionState::Active {
-            return Ok(Some(Decrypted {
-                want_close_before_decrypt: false,
-                plaintext: encr.copy_to_plain_message(out)?,
-            }));
+            return Err(Error::HandshakeNotComplete);
         }
 
-        let want_close_before_decrypt = seq == SEQ_SOFT_LIMIT;
-        let plaintext = self
-            .message_decrypter
-            .decrypt_to(&encr, seq, out)?;
-        Ok(Some(Decrypted {
-            want_close_before_decrypt,
-            plaintext,
-        }))
+        decrypt_to_with_authentication(self.message_decrypter.as_mut(), &encr, seq, out)
     }
 
     pub(crate) fn commit_read_seq_after_decrypt(&mut self, next_seq: u64) {
