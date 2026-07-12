@@ -1612,6 +1612,23 @@ impl State<ClientConnectionData> for ExpectTraffic {
             .try_decrypt_with_next_inbound_traffic_key(Side::Server, message, seq, out)
     }
 
+    fn try_decrypt_range_with_next_inbound_traffic_key<'a>(
+        &mut self,
+        message: &InboundOpaqueMessageImmut<'_>,
+        start_seq: u64,
+        end_seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<Option<crypto::cipher::SequenceAuthenticatedDecryptionOutcome<'a>>, Error> {
+        self.key_schedule
+            .try_decrypt_range_with_next_inbound_traffic_key(
+                Side::Server,
+                message,
+                start_seq,
+                end_seq,
+                out,
+            )
+    }
+
     fn commit_next_inbound_traffic_key(
         &mut self,
         common: &mut CommonState,

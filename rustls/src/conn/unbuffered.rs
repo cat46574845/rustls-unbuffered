@@ -8,7 +8,9 @@ use std::error::Error as StdError;
 
 use super::{UnbufferedConnectionCommon, hs_buffer_fast_is_active};
 use crate::client::ClientConnectionData;
-use crate::crypto::cipher::AuthenticatedDecryptionOutcome;
+use crate::crypto::cipher::{
+    AuthenticatedDecryptionOutcome, SequenceAuthenticatedDecryptionOutcome,
+};
 use crate::msgs::deframer::buffers::{BufferProgress, DeframerSliceBuffer};
 use crate::msgs::deframer::DeframerIterImmut;
 use crate::server::ServerConnectionData;
@@ -23,6 +25,27 @@ pub enum DangerousDecryptOutcome {
     AuthenticatedApplicationData(usize),
     /// AEAD authentication succeeded, but the inner plaintext is opaque to this API.
     AuthenticatedOpaque,
+}
+
+/// Result of an inclusive GHASH-once inbound TLS sequence-range trial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DangerousBatchDecryptOutcome {
+    /// The input does not contain exactly one complete TLS record.
+    NoCompleteSingleRecord,
+    /// No sequence in the inclusive range authenticated.
+    NoMatch,
+    /// Authentication succeeded and yielded TLS application data.
+    AuthenticatedApplicationData {
+        /// Matching inbound TLS record sequence.
+        seq: u64,
+        /// Number of application plaintext bytes written to the output.
+        plaintext_len: usize,
+    },
+    /// Authentication succeeded but the TLS inner plaintext is opaque here.
+    AuthenticatedOpaque {
+        /// Matching inbound TLS record sequence.
+        seq: u64,
+    },
 }
 
 impl UnbufferedConnectionCommon<ClientConnectionData> {
@@ -74,6 +97,23 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
         self.try_decrypt_one_record_to_at(record, seq, outgoing_tls)
     }
 
+    /// Search an inclusive current-key sequence range with provider batch
+    /// authentication and decrypt only the matching candidate.
+    pub fn dangerous_try_decrypt_record_to_sequence_range(
+        &mut self,
+        record: &[u8],
+        start_seq: u64,
+        end_seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<DangerousBatchDecryptOutcome, Error> {
+        self.try_decrypt_one_record_to_sequence_range(
+            record,
+            start_seq,
+            end_seq,
+            outgoing_tls,
+        )
+    }
+
     /// Try decrypting exactly one complete TLS 1.3 record with the speculative
     /// next inbound traffic key and an explicit record sequence number.
     ///
@@ -91,6 +131,23 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
         outgoing_tls: &mut [u8],
     ) -> Result<DangerousDecryptOutcome, Error> {
         self.try_decrypt_one_record_to_at_with_next_key(record, seq, outgoing_tls)
+    }
+
+    /// Search an inclusive speculative-next-key sequence range with provider
+    /// batch authentication and decrypt only the matching candidate.
+    pub fn dangerous_try_decrypt_record_to_sequence_range_with_next_key(
+        &mut self,
+        record: &[u8],
+        start_seq: u64,
+        end_seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<DangerousBatchDecryptOutcome, Error> {
+        self.try_decrypt_one_record_to_sequence_range_with_next_key(
+            record,
+            start_seq,
+            end_seq,
+            outgoing_tls,
+        )
     }
 
     /// Commit the inbound TLS record sequence after an externally scheduled
@@ -138,6 +195,91 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
 }
 
 impl<Data> UnbufferedConnectionCommon<Data> {
+    fn single_record_for_dangerous_trial<'a>(
+        &self,
+        record: &'a [u8],
+    ) -> Result<Option<crate::msgs::message::InboundOpaqueMessageImmut<'a>>, Error> {
+        if !self.core.common_state.may_receive_application_data
+            || hs_buffer_fast_is_active(&self.hs_buffer_fast)
+        {
+            return Err(Error::HandshakeNotComplete);
+        }
+        let mut iter = DeframerIterImmut::new(record);
+        let message = match iter.next().transpose()? {
+            Some(message) => message,
+            None => return Ok(None),
+        };
+        if iter.bytes_consumed() != record.len() {
+            return Ok(None);
+        }
+        Ok(Some(message))
+    }
+
+    fn map_batch_outcome(
+        outcome: Option<SequenceAuthenticatedDecryptionOutcome<'_>>,
+    ) -> DangerousBatchDecryptOutcome {
+        match outcome {
+            None => DangerousBatchDecryptOutcome::NoMatch,
+            Some(SequenceAuthenticatedDecryptionOutcome::Plaintext(seq, plaintext))
+                if plaintext.typ == ContentType::ApplicationData =>
+            {
+                DangerousBatchDecryptOutcome::AuthenticatedApplicationData {
+                    seq,
+                    plaintext_len: plaintext.payload.len(),
+                }
+            }
+            Some(SequenceAuthenticatedDecryptionOutcome::Plaintext(seq, _))
+            | Some(SequenceAuthenticatedDecryptionOutcome::Opaque(seq)) => {
+                DangerousBatchDecryptOutcome::AuthenticatedOpaque { seq }
+            }
+        }
+    }
+
+    fn try_decrypt_one_record_to_sequence_range(
+        &mut self,
+        record: &[u8],
+        start_seq: u64,
+        end_seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<DangerousBatchDecryptOutcome, Error> {
+        let Some(message) = self.single_record_for_dangerous_trial(record)? else {
+            return Ok(DangerousBatchDecryptOutcome::NoCompleteSingleRecord);
+        };
+        let outcome = self
+            .core
+            .common_state
+            .record_layer
+            .try_decrypt_incoming_to_sequence_range(
+                message,
+                start_seq,
+                end_seq,
+                outgoing_tls,
+            )?;
+        Ok(Self::map_batch_outcome(outcome))
+    }
+
+    fn try_decrypt_one_record_to_sequence_range_with_next_key(
+        &mut self,
+        record: &[u8],
+        start_seq: u64,
+        end_seq: u64,
+        outgoing_tls: &mut [u8],
+    ) -> Result<DangerousBatchDecryptOutcome, Error> {
+        let Some(message) = self.single_record_for_dangerous_trial(record)? else {
+            return Ok(DangerousBatchDecryptOutcome::NoCompleteSingleRecord);
+        };
+        let outcome = match self.core.state.as_mut() {
+            Ok(state) => state.try_decrypt_range_with_next_inbound_traffic_key(
+                &message,
+                start_seq,
+                end_seq,
+                outgoing_tls,
+            )?,
+            Err(error) => return Err(error.clone()),
+        };
+        Ok(Self::map_batch_outcome(outcome))
+    }
+
     fn try_decrypt_one_record_to_at<'a>(
         &mut self,
         record: &[u8],

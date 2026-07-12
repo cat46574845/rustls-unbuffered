@@ -11,7 +11,7 @@ use std::num::NonZeroUsize;
 use rustls::client::{ClientConnectionData, EarlyDataError, UnbufferedClientConnection};
 use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
 use rustls::unbuffered::{
-    ConnectionState, DangerousDecryptOutcome, EncodeError, EncryptError, FastReadLen,
+    ConnectionState, DangerousBatchDecryptOutcome, DangerousDecryptOutcome, EncodeError, EncryptError, FastReadLen,
     InsufficientSizeError, UnbufferedConnectionCommon, UnbufferedStatus, WriteTraffic,
 };
 use rustls::{CertificateError, ClientConfig, ServerConfig, SideData};
@@ -913,6 +913,42 @@ fn fast_refresh_traffic_keys_manually() {
 }
 
 #[test]
+fn fast_current_inbound_key_sequence_range_finds_the_only_match() {
+    let mut outcome = handshake(&rustls::version::TLS13);
+    let mut client = outcome.client.take().unwrap();
+    let mut server = outcome.server.take().unwrap();
+    let mut client_out = [0u8; 16384 + 256];
+    let mut server_out = [0u8; 16384 + 256];
+    let expected_seq = client.dangerous_read_seq();
+    let mut record = [0u8; 256];
+    let record_len = encrypt_server_record(
+        &mut server,
+        &mut server_out,
+        b"range-current",
+        &mut record,
+    );
+    let outcome = client
+        .dangerous_try_decrypt_record_to_sequence_range(
+            &record[..record_len],
+            expected_seq.saturating_sub(3),
+            expected_seq + 5,
+            &mut client_out,
+        )
+        .expect("current-key sequence range must execute");
+    match outcome {
+        DangerousBatchDecryptOutcome::AuthenticatedApplicationData {
+            seq,
+            plaintext_len,
+        } => {
+            assert_eq!(seq, expected_seq);
+            assert_eq!(&client_out[..plaintext_len], b"range-current");
+        }
+        other => panic!("expected current-key range match, got {other:?}"),
+    }
+    assert_eq!(client.dangerous_read_seq(), expected_seq);
+}
+
+#[test]
 fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
     let mut outcome = handshake(&rustls::version::TLS13);
     let mut client = outcome.client.take().unwrap();
@@ -978,6 +1014,27 @@ fn fast_speculative_next_inbound_key_is_transactional_across_two_generations() {
     ));
     assert_eq!(client.dangerous_read_seq(), initial_read_seq);
     assert!(client.dangerous_commit_next_inbound_key(0).is_err());
+    assert_eq!(client.dangerous_read_seq(), initial_read_seq);
+
+    let batch_len = match client
+        .dangerous_try_decrypt_record_to_sequence_range_with_next_key(
+            generation_one,
+            0,
+            6,
+            &mut client_out,
+        )
+        .expect("the next-key batch range must execute")
+    {
+        DangerousBatchDecryptOutcome::AuthenticatedApplicationData {
+            seq,
+            plaintext_len,
+        } => {
+            assert_eq!(seq, 0);
+            plaintext_len
+        }
+        other => panic!("expected authenticated next-key batch record, got {other:?}"),
+    };
+    assert_eq!(&client_out[..batch_len], b"generation-one");
     assert_eq!(client.dangerous_read_seq(), initial_read_seq);
 
     let len = authenticated_application_data_len(

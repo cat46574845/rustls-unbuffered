@@ -3,6 +3,7 @@ use core::cmp::min;
 
 use crate::crypto::cipher::{
     AuthenticatedDecryptionOutcome, InboundOpaqueMessage, MessageDecrypter, MessageEncrypter,
+    SequenceAuthenticatedDecryptionOutcome,
     decrypt_to_with_authentication,
 };
 use crate::error::Error;
@@ -165,6 +166,25 @@ impl RecordLayer {
         }
 
         decrypt_to_with_authentication(self.message_decrypter.as_mut(), &encr, seq, out)
+    }
+
+    pub(crate) fn try_decrypt_incoming_to_sequence_range<'a>(
+        &mut self,
+        encr: InboundOpaqueMessageImmut<'_>,
+        start_seq: u64,
+        end_seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<Option<SequenceAuthenticatedDecryptionOutcome<'a>>, Error> {
+        if self.decrypt_state != DirectionState::Active {
+            return Err(Error::HandshakeNotComplete);
+        }
+        crate::crypto::cipher::decrypt_to_sequence_range_with_authentication(
+            self.message_decrypter.as_mut(),
+            &encr,
+            start_seq,
+            end_seq,
+            out,
+        )
     }
 
     pub(crate) fn commit_read_seq_after_decrypt(&mut self, next_seq: u64) {

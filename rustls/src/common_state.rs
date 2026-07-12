@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use pki_types::CertificateDer;
 
 use crate::conn::kernel::KernelState;
-use crate::crypto::cipher::AuthenticatedDecryptionOutcome;
+use crate::crypto::cipher::{
+    AuthenticatedDecryptionOutcome, SequenceAuthenticatedDecryptionOutcome,
+};
 use crate::crypto::SupportedKxGroup;
 use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
 use crate::error::{Error, InvalidMessage, PeerMisbehaved};
@@ -872,6 +874,16 @@ pub(crate) trait State<Data>: Send + Sync {
         _seq: u64,
         _out: &'a mut [u8],
     ) -> Result<AuthenticatedDecryptionOutcome<'a>, Error> {
+        Err(Error::HandshakeNotComplete)
+    }
+
+    fn try_decrypt_range_with_next_inbound_traffic_key<'a>(
+        &mut self,
+        _message: &InboundOpaqueMessageImmut<'_>,
+        _start_seq: u64,
+        _end_seq: u64,
+        _out: &'a mut [u8],
+    ) -> Result<Option<SequenceAuthenticatedDecryptionOutcome<'a>>, Error> {
         Err(Error::HandshakeNotComplete)
     }
 

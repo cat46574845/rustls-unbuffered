@@ -181,11 +181,34 @@ pub trait MessageDecrypter: Send + Sync {
             "decrypt_to authentication outcome not implemented".into(),
         ))
     }
+
+    /// Authenticate an inclusive sequence range with shared record work, then
+    /// decrypt only the matching sequence. Providers without a batch primitive
+    /// leave this unsupported.
+    fn decrypt_to_sequence_range_with_authentication<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        start_seq: u64,
+        end_seq: u64,
+        out: &'a mut [u8],
+        matched_seq: &mut Option<u64>,
+    ) -> Result<Option<InboundPlainMessage<'a>>, Error> {
+        let _ = (msg, start_seq, end_seq, out);
+        *matched_seq = None;
+        Err(Error::General(
+            "sequence-range decrypt not implemented".into(),
+        ))
+    }
 }
 
 pub(crate) enum AuthenticatedDecryptionOutcome<'a> {
     Plaintext(InboundPlainMessage<'a>),
     Opaque,
+}
+
+pub(crate) enum SequenceAuthenticatedDecryptionOutcome<'a> {
+    Plaintext(u64, InboundPlainMessage<'a>),
+    Opaque(u64),
 }
 
 pub(crate) fn decrypt_to_with_authentication<'a>(
@@ -198,6 +221,35 @@ pub(crate) fn decrypt_to_with_authentication<'a>(
     match decrypter.decrypt_to_with_authentication(msg, seq, out, &mut authenticated) {
         Ok(plaintext) => Ok(AuthenticatedDecryptionOutcome::Plaintext(plaintext)),
         Err(_) if authenticated => Ok(AuthenticatedDecryptionOutcome::Opaque),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn decrypt_to_sequence_range_with_authentication<'a>(
+    decrypter: &mut dyn MessageDecrypter,
+    msg: &InboundOpaqueMessageImmut<'_>,
+    start_seq: u64,
+    end_seq: u64,
+    out: &'a mut [u8],
+) -> Result<Option<SequenceAuthenticatedDecryptionOutcome<'a>>, Error> {
+    let mut matched_seq = None;
+    match decrypter.decrypt_to_sequence_range_with_authentication(
+        msg,
+        start_seq,
+        end_seq,
+        out,
+        &mut matched_seq,
+    ) {
+        Ok(Some(plaintext)) => Ok(Some(SequenceAuthenticatedDecryptionOutcome::Plaintext(
+            matched_seq.expect("batch provider returning plaintext must report its matched sequence"),
+            plaintext,
+        ))),
+        Ok(None) => Ok(None),
+        Err(_) if matched_seq.is_some() => Ok(Some(
+            SequenceAuthenticatedDecryptionOutcome::Opaque(
+                matched_seq.expect("authenticated batch outcome must retain matched sequence"),
+            ),
+        )),
         Err(error) => Err(error),
     }
 }

@@ -7,6 +7,7 @@ use core::ops::Deref;
 use crate::common_state::{CommonState, Side};
 use crate::crypto::cipher::{
     AeadKey, AuthenticatedDecryptionOutcome, Iv, MessageDecrypter, Tls13AeadAlgorithm,
+    SequenceAuthenticatedDecryptionOutcome, decrypt_to_sequence_range_with_authentication,
     decrypt_to_with_authentication,
 };
 use crate::crypto::tls13::{Hkdf, HkdfExpander, OkmBlock, OutputLengthError, expand};
@@ -608,6 +609,35 @@ impl KeyScheduleTraffic {
         let outcome =
             decrypt_to_with_authentication(next.decrypter.as_mut(), message, seq, out)?;
         next.validated_seq = Some(seq);
+        Ok(outcome)
+    }
+
+    pub(crate) fn try_decrypt_range_with_next_inbound_traffic_key<'a>(
+        &mut self,
+        side: Side,
+        message: &InboundOpaqueMessageImmut<'_>,
+        start_seq: u64,
+        end_seq: u64,
+        out: &'a mut [u8],
+    ) -> Result<Option<SequenceAuthenticatedDecryptionOutcome<'a>>, Error> {
+        let next = self
+            .next_inbound_traffic_key
+            .as_mut()
+            .filter(|next| next.side == side)
+            .ok_or(Error::HandshakeNotComplete)?;
+        let outcome = decrypt_to_sequence_range_with_authentication(
+            next.decrypter.as_mut(),
+            message,
+            start_seq,
+            end_seq,
+            out,
+        )?;
+        if let Some(ref authenticated) = outcome {
+            next.validated_seq = Some(match authenticated {
+                SequenceAuthenticatedDecryptionOutcome::Plaintext(seq, _) => *seq,
+                SequenceAuthenticatedDecryptionOutcome::Opaque(seq) => *seq,
+            });
+        }
         Ok(outcome)
     }
 

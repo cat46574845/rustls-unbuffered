@@ -224,7 +224,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "aws-lc-fips-sys"
 version = "0.13.8"
-source = "git+https://github.com/cat46574845/aws-lc-rs.git?branch=rustls-zero-copy#4c081cdbb482cc49b115dc6feed1e8cf8999cd5e"
+source = "git+https://github.com/cat46574845/aws-lc-rs.git?branch=rustls-zero-copy#a2d46a2fb7890902870585c8bf968a6aab425974"
 dependencies = [
  "bindgen",
  "cc",
@@ -238,7 +238,7 @@ dependencies = [
 [[package]]
 name = "aws-lc-rs"
 version = "1.14.1"
-source = "git+https://github.com/cat46574845/aws-lc-rs.git?branch=rustls-zero-copy#4c081cdbb482cc49b115dc6feed1e8cf8999cd5e"
+source = "git+https://github.com/cat46574845/aws-lc-rs.git?branch=rustls-zero-copy#a2d46a2fb7890902870585c8bf968a6aab425974"
 dependencies = [
  "aws-lc-fips-sys",
  "aws-lc-sys",
@@ -248,7 +248,7 @@ dependencies = [
 [[package]]
 name = "aws-lc-sys"
 version = "0.32.0"
-source = "git+https://github.com/cat46574845/aws-lc-rs.git?branch=rustls-zero-copy#4c081cdbb482cc49b115dc6feed1e8cf8999cd5e"
+source = "git+https://github.com/cat46574845/aws-lc-rs.git?branch=rustls-zero-copy#a2d46a2fb7890902870585c8bf968a6aab425974"
 dependencies = [
  "bindgen",
  "cc",
@@ -306,7 +306,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1757,7 +1757,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07033963ba89ebaf1584d767badaa2e8fcec21aedea6b8c0346d487d49c28667"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]

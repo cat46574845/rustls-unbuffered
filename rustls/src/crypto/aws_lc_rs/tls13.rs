@@ -617,6 +617,65 @@ impl MessageDecrypter for GcmMessageDecrypter {
         *authenticated = false;
         self.decrypt_to_notifying_authentication(msg, seq, out, || *authenticated = true)
     }
+
+    fn decrypt_to_sequence_range_with_authentication<'a>(
+        &mut self,
+        msg: &InboundOpaqueMessageImmut<'_>,
+        start_seq: u64,
+        end_seq: u64,
+        out: &'a mut [u8],
+        matched_seq: &mut Option<u64>,
+    ) -> Result<Option<InboundPlainMessage<'a>>, Error> {
+        *matched_seq = None;
+        let tag_len = self.dec_key.algorithm().tag_len();
+        if tag_len != 16 || msg.payload.len() < tag_len {
+            return Err(Error::DecryptError);
+        }
+        let ciphertext_len = msg.payload.len() - tag_len;
+        if out.len() < ciphertext_len {
+            return Err(Error::General("output buffer too small".into()));
+        }
+        let (ciphertext, tag) = msg.payload.split_at(ciphertext_len);
+        let tag: &[u8; 16] = tag.try_into().map_err(|_| Error::DecryptError)?;
+        let iv: &[u8; 12] = self.iv.as_ref().try_into().map_err(|_| {
+            Error::General("TLS 1.3 AES-GCM IV must contain 12 bytes".into())
+        })?;
+        let seq = self
+            .dec_key
+            .open_sequence_range_gather(
+                iv,
+                start_seq,
+                end_seq,
+                aead::Aad::from(make_tls13_aad(msg.payload.len())),
+                ciphertext,
+                tag,
+                &mut out[..ciphertext_len],
+            )
+            .map_err(|_| Error::DecryptError)?;
+        let Some(seq) = seq else {
+            return Ok(None);
+        };
+        *matched_seq = Some(seq);
+
+        let mut content_type_byte = 0u8;
+        let mut actual_len = ciphertext_len;
+        for i in (0..ciphertext_len).rev() {
+            if out[i] != 0 {
+                content_type_byte = out[i];
+                actual_len = i;
+                break;
+            }
+        }
+        let typ = ContentType::from(content_type_byte);
+        if typ == ContentType::Unknown(0) {
+            return Err(Error::DecryptError);
+        }
+        Ok(Some(InboundPlainMessage {
+            typ,
+            version: ProtocolVersion::TLSv1_3,
+            payload: &out[..actual_len],
+        }))
+    }
 }
 
 struct AwsLcHkdf(hkdf::Algorithm, hmac::Algorithm);
