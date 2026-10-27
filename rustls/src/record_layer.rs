@@ -230,21 +230,6 @@ impl RecordLayer {
             .unwrap()
     }
 
-    /// `encrypt_outgoing_to`'s encryption of `plain` under this direction's keys with nothing consumed,
-    /// for warming the record path's code and keys into cache: the sequence number is `u64::MAX`, which
-    /// no record reaches (records stop at `SEQ_HARD_LIMIT`), so its nonce never protects a record, and
-    /// the output is the caller's to discard.
-    pub(crate) fn warm_encrypt_to(
-        &mut self,
-        plain: OutboundPlainMessage<'_>,
-        outgoing_tls: &mut [u8],
-    ) -> usize {
-        debug_assert!(self.encrypt_state == DirectionState::Active);
-        self.message_encrypter
-            .encrypt_to(plain, u64::MAX, outgoing_tls)
-            .unwrap()
-    }
-
     /// Prepare to use the given `MessageEncrypter` for future message encryption.
     /// It is not used until you call `start_encrypting`.
     pub(crate) fn prepare_message_encrypter(
