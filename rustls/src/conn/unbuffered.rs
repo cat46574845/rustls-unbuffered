@@ -937,6 +937,23 @@ impl<Data> WriteTraffic<'_, Data> {
             .write_plaintext(application_data.into(), outgoing_tls)
     }
 
+    /// Encrypts `application_data` as [`Self::encrypt`] would into `outgoing_tls`, with nothing consumed:
+    /// no record sequence number, key update or pending record is taken, and the bytes written are not
+    /// records of this connection, so they must be discarded. A latency-sensitive caller runs it while
+    /// idle to keep this connection's keys and record path in cache.
+    ///
+    /// Returns the number of bytes written, or an error if `outgoing_tls` is too small.
+    pub fn warm_encrypt(
+        &mut self,
+        application_data: &[u8],
+        outgoing_tls: &mut [u8],
+    ) -> Result<usize, EncryptError> {
+        self.conn
+            .core
+            .common_state
+            .warm_write_plaintext(application_data.into(), outgoing_tls)
+    }
+
     /// Encrypts a close_notify warning alert in `outgoing_tls`
     ///
     /// Returns the number of bytes that were written into `outgoing_tls`, or an error if
