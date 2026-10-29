@@ -230,6 +230,18 @@ impl RecordLayer {
             .unwrap()
     }
 
+    /// `encrypt_outgoing_to`'s encryption of `plain` under this direction's key with nothing consumed (see
+    /// `MessageEncrypter::warm_encrypt_to`): no sequence number is taken and the output is not a record.
+    pub(crate) fn warm_encrypt_to(
+        &mut self,
+        plain: OutboundPlainMessage<'_>,
+        outgoing_tls: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        debug_assert!(self.encrypt_state == DirectionState::Active);
+        self.message_encrypter
+            .warm_encrypt_to(plain, outgoing_tls)
+    }
+
     /// Prepare to use the given `MessageEncrypter` for future message encryption.
     /// It is not used until you call `start_encrypting`.
     pub(crate) fn prepare_message_encrypter(

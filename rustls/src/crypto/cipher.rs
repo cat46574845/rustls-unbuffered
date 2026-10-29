@@ -285,6 +285,19 @@ pub trait MessageEncrypter: Send + Sync {
         Ok(encoded.len())
     }
 
+    /// `encrypt_to`'s encryption of `msg` under this encrypter's key with a nonce no record uses (sequence
+    /// number `u64::MAX`; records stop at `SEQ_HARD_LIMIT`), for keeping the key and the record code in cache.
+    /// The output is not a record and must be discarded. `Ok(None)` when this encrypter cannot encrypt outside
+    /// its record sequence (a key that requires increasing nonces); the default.
+    fn warm_encrypt_to(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        outgoing_tls: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        let _ = (msg, outgoing_tls);
+        Ok(None)
+    }
+
     /// Return the length of the ciphertext that results from encrypting plaintext of
     /// length `payload_len`
     fn encrypted_payload_len(&self, payload_len: usize) -> usize;

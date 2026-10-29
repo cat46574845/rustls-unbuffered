@@ -179,18 +179,15 @@ impl Tls13AeadAlgorithm for Aes128GcmAead {
 struct AeadAlgorithm(&'static aead::Algorithm);
 
 impl AeadAlgorithm {
-    // using aead::TlsRecordSealingKey
+    // A plain AES-GCM key, not aead::TlsRecordSealingKey: that key also requires every nonce to exceed the last
+    // one, so it cannot encrypt the warming record of `warm_encrypt_to`. The nonces are the same (the record
+    // layer's increasing sequence numbers), and so is the ciphertext.
     fn encrypter(&self, key: AeadKey, iv: Iv) -> Box<dyn MessageEncrypter> {
         // safety:
         // - the caller arranges that `key` is `key_len()` in bytes, so this unwrap is safe.
         // - this function should only be used for `Algorithm::AES_128_GCM` or `Algorithm::AES_256_GCM`
         Box::new(GcmMessageEncrypter {
-            enc_key: aead::TlsRecordSealingKey::new(
-                self.0,
-                aead::TlsProtocolId::TLS13,
-                key.as_ref(),
-            )
-            .unwrap(),
+            enc_key: aead::LessSafeKey::new(aead::UnboundKey::new(self.0, key.as_ref()).unwrap()),
             iv,
         })
     }
@@ -340,6 +337,15 @@ impl MessageEncrypter for AeadMessageEncrypter {
         Ok(written)
     }
 
+    fn warm_encrypt_to(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        outgoing_tls: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        self.encrypt_to(msg, u64::MAX, outgoing_tls)
+            .map(Some)
+    }
+
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
         payload_len + 1 + self.enc_key.algorithm().tag_len()
     }
@@ -452,7 +458,7 @@ impl MessageDecrypter for AeadMessageDecrypter {
 }
 
 struct GcmMessageEncrypter {
-    enc_key: aead::TlsRecordSealingKey,
+    enc_key: aead::LessSafeKey,
     iv: Iv,
 }
 
@@ -502,6 +508,15 @@ impl MessageEncrypter for GcmMessageEncrypter {
         payload[seal_len..].copy_from_slice(tag.as_ref());
 
         Ok(written)
+    }
+
+    fn warm_encrypt_to(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        outgoing_tls: &mut [u8],
+    ) -> Result<Option<usize>, Error> {
+        self.encrypt_to(msg, u64::MAX, outgoing_tls)
+            .map(Some)
     }
 
     fn encrypted_payload_len(&self, payload_len: usize) -> usize {
@@ -881,12 +896,7 @@ mod tests {
     #[test]
     fn test_gcm_aes128_decrypt_to() {
         let key_bytes = [0x42u8; 16]; // AES-128 需要 16 字節密鑰
-        let enc_key = aead::TlsRecordSealingKey::new(
-            &aead::AES_128_GCM,
-            aead::TlsProtocolId::TLS13,
-            &key_bytes,
-        )
-        .unwrap();
+        let enc_key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key_bytes).unwrap());
 
         let dec_key = aead::TlsRecordOpeningKey::new(
             &aead::AES_128_GCM,
@@ -936,12 +946,7 @@ mod tests {
     fn test_gcm_aes128_encrypt_to_decrypt_to() {
         let key_bytes = [0x42u8; 16];
 
-        let enc_key = aead::TlsRecordSealingKey::new(
-            &aead::AES_128_GCM,
-            aead::TlsProtocolId::TLS13,
-            &key_bytes,
-        )
-        .unwrap();
+        let enc_key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &key_bytes).unwrap());
         let dec_key = aead::TlsRecordOpeningKey::new(
             &aead::AES_128_GCM,
             aead::TlsProtocolId::TLS13,
@@ -995,12 +1000,7 @@ mod tests {
         let key_bytes = [0x42u8; 32]; // AES-256 需要 32 字節密鑰
         let iv = Iv::new([0x01u8; 12]);
 
-        let enc_key = aead::TlsRecordSealingKey::new(
-            &aead::AES_256_GCM,
-            aead::TlsProtocolId::TLS13,
-            &key_bytes,
-        )
-        .unwrap();
+        let enc_key = aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_256_GCM, &key_bytes).unwrap());
 
         let dec_key = aead::TlsRecordOpeningKey::new(
             &aead::AES_256_GCM,

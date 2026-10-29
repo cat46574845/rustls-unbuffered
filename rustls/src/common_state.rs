@@ -293,6 +293,42 @@ impl CommonState {
         Ok(self.write_fragments(outgoing_tls, fragments))
     }
 
+    /// `write_plaintext`'s fragmentation and record encryption of `payload` into `outgoing_tls` with nothing
+    /// consumed or queued: no sequence number, key update or pending record is taken
+    /// (`RecordLayer::warm_encrypt_to`). The bytes written are not records of this connection. `Ok(None)` when
+    /// the negotiated cipher cannot encrypt outside its record sequence.
+    pub(crate) fn warm_write_plaintext(
+        &mut self,
+        payload: OutboundChunks<'_>,
+        outgoing_tls: &mut [u8],
+    ) -> Result<Option<usize>, EncryptError> {
+        let fragments = self
+            .message_fragmenter
+            .fragment_payload(
+                ContentType::ApplicationData,
+                ProtocolVersion::TLSv1_2,
+                payload,
+            );
+        let mut written = 0;
+        for m in fragments {
+            let required_size = written + m.encoded_len(&self.record_layer);
+            if required_size > outgoing_tls.len() {
+                return Err(EncryptError::InsufficientSize(InsufficientSizeError {
+                    required_size,
+                }));
+            }
+            match self
+                .record_layer
+                .warm_encrypt_to(m, &mut outgoing_tls[written..])
+            {
+                Ok(Some(n)) => written += n,
+                Ok(None) => return Ok(None),
+                Err(_) => return Err(EncryptError::EncryptExhausted),
+            }
+        }
+        Ok(Some(written))
+    }
+
     // Changing the keys must not span any fragmented handshake
     // messages.  Otherwise the defragmented messages will have
     // been protected with two different record layer protections,
